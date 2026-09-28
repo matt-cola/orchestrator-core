@@ -68,7 +68,11 @@ History rows (`input_states`, `process_steps`) are **never rewritten**. Rotation
 3. Apply: `orchestrator secrets rewrap-sealed-secrets --execute` (confirms, rewrites current
    subscription values batch by batch with per-batch verify, resumable on crash).
 4. Gate: `orchestrator secrets rewrap-sealed-secrets --check` (exit 0 when no rows remain on old
-   keys) — then remove `<old>` and deploy. Destroy the old key material.
+   keys). **Before dropping the old key:** `--check` covers current subscription values only.
+   History rows (`input_states`, `process_steps`) still carry envelopes sealed under `<old>` and
+   are never rewritten — removing the key from the ring makes those historical envelopes
+   **permanently undecryptable**. Drop `<old>` only when decrypting history is no longer required,
+   then deploy and destroy the old key material.
 
 There is intentionally no scheduled re-encryption task: a timer that decrypts every secret row
 maximizes key exposure for no functional benefit. The command above is manual and audited, rewrites
@@ -80,6 +84,11 @@ secret values.
 - Cleartext transiently exists in the TLS-terminated request body, in server RAM during the single
   validation call, and again when a step decrypts the secret to use it. This matches the standard
   HTTPS-login model; the guarantee covers storage, not RAM.
+- At `LOG_LEVEL=DEBUG`, `pydantic_forms` itself logs raw `user_inputs` (in `post_form` and its
+  translation step), so cleartext can still reach the log pipeline at debug level. Keep production
+  log level at INFO or above. The validation-error logs in `orchestrator.core` are safe at any
+  level: sealed values are masked — or the inputs omitted entirely when the form's sealed fields
+  cannot be resolved — and the logged error message never carries field input values.
 - A compromised key reads all rows sealed under it. Keep the ring at 1–2 keys, keep keys out of
   backups and log pipelines, and never expose `SEALED_SECRETS_FERNET_KEYS` via settings endpoints.
 - Envelopes leak approximate plaintext length and are visible to anyone with database or API read
