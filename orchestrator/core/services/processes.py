@@ -40,6 +40,7 @@ from orchestrator.core.db import (
 from orchestrator.core.db.database import transactional
 from orchestrator.core.db.models import FAILED_REASON_LENGTH, TRACEBACK_LENGTH
 from orchestrator.core.distlock import distlock_manager
+from orchestrator.core.forms.validators.sealed_secret import redacted_user_inputs
 from orchestrator.core.schemas.engine_settings import WorkerStatus
 from orchestrator.core.search.indexing.hooks import index_process_and_subscriptions
 from orchestrator.core.services.executors.types import ExecutorFunction
@@ -81,6 +82,7 @@ from pydantic_forms.exceptions import FormValidationError
 from pydantic_forms.types import State, UUIDstr
 
 logger = structlog.get_logger(__name__)
+
 
 def merge_state(base: State, nxt: State) -> State:
     """Recursively merge `nxt` into `base`.
@@ -575,7 +577,10 @@ def create_process(
     try:
         state = post_form(workflow.initial_input_form, initial_state, user_inputs)
     except FormValidationError:
-        logger.exception("Validation errors", user_inputs=user_inputs)
+        logger.exception(
+            "Validation errors",
+            user_inputs=redacted_user_inputs(workflow.initial_input_form, initial_state, user_inputs),
+        )
         raise
 
     pstat = ProcessStat(
@@ -699,7 +704,10 @@ def resume_process(
     try:
         user_input = post_form(pstat.log[0].form, pstat.state.unwrap(), user_inputs=user_inputs or [{}])
     except FormValidationError:
-        logger.exception("Validation errors", user_inputs=user_inputs)
+        logger.exception(
+            "Validation errors",
+            user_inputs=redacted_user_inputs(pstat.log[0].form, pstat.state.unwrap(), user_inputs),
+        )
         raise
 
     # Not committing the SessionTransaction here; triggering the execution takes care of this.
