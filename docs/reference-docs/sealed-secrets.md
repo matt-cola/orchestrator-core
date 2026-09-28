@@ -64,14 +64,16 @@ Invalid keys are rejected at startup.
 History rows (`input_states`, `process_steps`) are **never rewritten**. Rotation is lazy:
 
 1. Generate a new key. Prepend it: `'["<new>", "<old>"]'`. Deploy.
-2. New submissions encrypt under `<new>` (envelope key ids tell them apart). Old envelopes keep
-   decrypting while `<old>` is listed. No downtime; suspended/failed processes stay resumable.
-3. After the grace period (no current-value rows reference the old key id, or per policy N days),
-   remove `<old>` and deploy. Destroy the old key material.
+2. Preview: `orchestrator secrets rewrap-sealed-secrets` (dry run, no writes).
+3. Apply: `orchestrator secrets rewrap-sealed-secrets --execute` (confirms, rewrites current
+   subscription values batch by batch with per-batch verify, resumable on crash).
+4. Gate: `orchestrator secrets rewrap-sealed-secrets --check` (exit 0 when no rows remain on old
+   keys) — then remove `<old>` and deploy. Destroy the old key material.
 
 There is intentionally no scheduled re-encryption task: a timer that decrypts every secret row
-maximizes key exposure for no functional benefit. If policy requires bounded old-key lifetime, run a
-manual, audited rewrap of *current subscription values only* during the rotation window.
+maximizes key exposure for no functional benefit. The command above is manual and audited, rewrites
+*current subscription values only* (never history), and reports failed row ids without ever printing
+secret values.
 
 ## Residual risks
 

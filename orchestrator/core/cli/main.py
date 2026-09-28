@@ -17,12 +17,14 @@ from orchestrator.core.cli import (
     database,
     generate,
     scheduler,
+    secrets,
 )
 from orchestrator.core.cli.search import index_llm, resize_embedding, search_explore, speedtest
 
 app = typer.Typer()
 app.add_typer(scheduler.app, name="scheduler", help="Access all the scheduler functions")
 app.add_typer(database.app, name="db", help="Interact with the application database")
+app.add_typer(secrets.app, name="secrets", help="Manage sealed secrets (rotation maintenance)")
 app.add_typer(generate.app, name="generate", help="Generate products, workflows and other artifacts")
 app.add_typer(index_llm.app, name="index", help="(Re-)Index the search table.")
 app.add_typer(search_explore.app, name="search", help="Try out different search types.")
