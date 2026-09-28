@@ -20,7 +20,8 @@ workflow steps, via :func:`decrypt_sealed_secret`.
 
 This module also hosts the log-redaction helpers. Raw ``user_inputs`` are logged on validation failure
 (``services/processes.py``), which would persist cleartext into the log pipeline. Redaction masks *only*
-the values of sealed-secret fields, leaving every other field untouched for debuggability.
+the values of sealed-secret fields, leaving every other field untouched for debuggability; when the
+form's sealed fields cannot be fully resolved, the values are omitted from the log entirely.
 """
 
 import re
@@ -307,19 +308,22 @@ def sealed_field_names(
 ) -> tuple[frozenset[str], bool]:
     """Best-effort collection of sealed-secret field names for the current form.
 
-    Drives the form generator *without validating anything*: yielded page classes are inspected for the
-    ``sealedSecret`` format marker. Raw page dicts are fed back in so conditional generators advance;
-    any failure part-way still keeps the names collected so far.
+    Drives the form generator exactly like ``post_form`` does: each submitted page is validated
+    (``form(**page)``) and the resulting model is sent back, so generators that access attributes of
+    prior pages (the standard ``data.model_dump()`` pattern) advance correctly. A page's sealed field
+    names are collected before attempting to advance past it; a page's own validation failure is the
+    expected stopping point, and later pages' forms are then unknown.
 
     Args:
         form_generator: The workflow's input-form generator (or a single form class, or None).
         state: Current workflow state, passed to the generator as ``post_form`` would.
-        user_inputs: Raw per-page input dicts, fed back to advance conditional generators.
+        user_inputs: Raw per-page input dicts, used to advance conditional generators.
 
     Returns:
-        A ``(names, resolved)`` pair. ``resolved`` is False only when even the first page could not be
-        obtained (generator raised immediately); callers must then omit values from logs rather than
-        risk leaking cleartext. An empty-but-resolved result authoritatively means "no sealed fields".
+        A ``(names, resolved)`` pair. ``resolved`` is True only when every submitted page's form class
+        was positively identified (or there was nothing to submit); otherwise callers must omit values
+        from logs rather than risk leaking cleartext. An empty-but-resolved result authoritatively
+        means "no sealed fields".
     """
     if form_generator is None:
         return frozenset(), True
@@ -339,17 +343,20 @@ def sealed_field_names(
         logger.debug("Could not resolve sealed field names from form generator")
         return frozenset(), False
 
-    resolved = True
+    resolved = not pages
     try:
-        for index in range(_MAX_GENERATOR_PAGES):
+        for index in range(min(len(pages), _MAX_GENERATOR_PAGES)):
             names.update(_sealed_fields_of_model(yielded))
-            data = pages[index] if index < len(pages) else {}
-            try:
-                yielded = iterator.send(data)
-            except StopIteration:
+            if index + 1 >= len(pages):
+                # Last submitted page identified; advancing past it is not needed for redaction.
+                resolved = True
                 break
-    except Exception:  # noqa: BLE001 - keep names collected so far; still resolved
-        logger.debug("Form generator walk ended early; using sealed field names collected so far")
+            # Advance exactly like post_form: send the validated page model, never the raw dict.
+            yielded = iterator.send(yielded(**pages[index]))
+    except StopIteration:
+        pass  # generator finished; any unsubmitted-later pages are unknown and keep resolved False
+    except Exception:  # noqa: BLE001 - incomplete names omit values downstream
+        logger.debug("Form generator walk ended early; sealed field names incomplete")
     return frozenset(names), resolved
 
 
@@ -406,9 +413,10 @@ def redacted_user_inputs(
 ) -> list[dict[str, Any]] | dict[str, str]:
     """Log-safe copy of ``user_inputs``: only cleartext sealed values are masked, nothing else.
 
-    When sealed field names cannot be resolved (generator raised immediately), values are omitted
-    entirely rather than risk leaking cleartext — the safe direction. Runs on the validation-error
-    path only, never on the hot path.
+    When any submitted page's form class cannot be identified (unresolvable generator, or advancing
+    would require passing a page whose validation failed), values are omitted entirely rather than
+    risk leaking cleartext — the safe direction. Runs on the validation-error path only, never on the
+    hot path.
 
     Args:
         form_generator: The workflow's input-form generator, as passed to ``post_form``.

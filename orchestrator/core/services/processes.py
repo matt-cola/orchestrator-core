@@ -576,10 +576,15 @@ def create_process(
 
     try:
         state = post_form(workflow.initial_input_form, initial_state, user_inputs)
-    except FormValidationError:
-        logger.exception(
+    except FormValidationError as e:
+        # Log the redacted inputs and the safe per-field message. Do NOT use logger.exception: the
+        # chained raw pydantic ValidationError renders each failing field's input_value, which for a
+        # sealed-secret field is the cleartext secret. FormValidationError.__str__ carries the same
+        # per-field detail (loc/msg/type/ctx) without any input values.
+        logger.error(
             "Validation errors",
             user_inputs=redacted_user_inputs(workflow.initial_input_form, initial_state, user_inputs),
+            error=str(e),
         )
         raise
 
@@ -703,10 +708,15 @@ def resume_process(
 
     try:
         user_input = post_form(pstat.log[0].form, pstat.state.unwrap(), user_inputs=user_inputs or [{}])
-    except FormValidationError:
-        logger.exception(
+    except FormValidationError as e:
+        # Log the redacted inputs and the safe per-field message. Do NOT use logger.exception: the
+        # chained raw pydantic ValidationError renders each failing field's input_value, which for a
+        # sealed-secret field is the cleartext secret. FormValidationError.__str__ carries the same
+        # per-field detail (loc/msg/type/ctx) without any input values.
+        logger.error(
             "Validation errors",
             user_inputs=redacted_user_inputs(pstat.log[0].form, pstat.state.unwrap(), user_inputs),
+            error=str(e),
         )
         raise
 
