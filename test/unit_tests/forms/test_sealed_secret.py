@@ -14,16 +14,29 @@
 from typing import Annotated, Any
 
 import pytest
-from pydantic import BaseModel, Field
+from cryptography.fernet import Fernet
+from pydantic import BaseModel, Field, SecretStr, ValidationError
 
+from orchestrator.core.forms.summary_form.summary_form import _get_column_values
 from orchestrator.core.forms.validators.sealed_secret import (
+    MAX_SEALED_PLAINTEXT_BYTES,
     SEALED_REDACTED,
+    SEALED_SUMMARY_MASK,
+    SealedSecret,
+    SealedSecretDecryptionError,
+    SealedSecretsDisabledError,
+    decrypt_sealed_secret,
+    encrypt_sealed_secret,
     is_sealed_envelope,
     is_sealed_secret_annotation,
+    key_id_for_fernet_key,
     mask_sealed_cleartext,
     redacted_user_inputs,
+    resolve_sealed_secret_update,
     sealed_field_names,
 )
+from orchestrator.core.search.indexing.traverse import BaseTraverser
+from orchestrator.core.settings import AppSettings, app_settings
 from pydantic_forms.core import FormPage
 
 SECRET = "s3cr3t-cleartext-password"  # noqa: S105 - test fixture, not a credential
@@ -171,3 +184,187 @@ def test_is_sealed_secret_annotation():
     assert is_sealed_secret_annotation(str) is False
     assert is_sealed_secret_annotation(None) is False
     assert is_sealed_secret_annotation(NestedInner) is True
+
+
+# --- Fernet envelope round-trip (commit 2) ---
+
+KEY_A = Fernet.generate_key().decode()
+KEY_B = Fernet.generate_key().decode()
+
+
+@pytest.fixture()
+def sealed_keys(monkeypatch):
+    """Configure a single sealed-secret key, restored after the test."""
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_A)])
+    return [KEY_A]
+
+
+@pytest.fixture()
+def rotated_keys(monkeypatch):
+    """Configure a rotated ring: newest first."""
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_B), SecretStr(KEY_A)])
+    return [KEY_B, KEY_A]
+
+
+def test_encrypt_decrypt_roundtrip(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    assert is_sealed_envelope(envelope)
+    assert envelope.startswith(f"fernet-v1:{key_id_for_fernet_key(KEY_A)}:")
+    assert SECRET not in envelope
+    assert decrypt_sealed_secret(envelope) == SECRET
+
+
+def test_encrypt_randomizes_envelopes(sealed_keys):
+    assert encrypt_sealed_secret(SECRET) != encrypt_sealed_secret(SECRET)
+
+
+def test_encrypt_fails_closed_when_disabled(monkeypatch):
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [])
+    with pytest.raises(SealedSecretsDisabledError):
+        encrypt_sealed_secret(SECRET)
+
+
+def test_encrypt_rejects_oversize_plaintext(sealed_keys):
+    with pytest.raises(ValueError, match="exceeds"):
+        encrypt_sealed_secret("x" * (MAX_SEALED_PLAINTEXT_BYTES + 1))
+
+
+def test_decrypt_old_envelope_after_rotation(monkeypatch):
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_A)])
+    old_envelope = encrypt_sealed_secret(SECRET)
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_B), SecretStr(KEY_A)])
+    assert decrypt_sealed_secret(old_envelope) == SECRET
+
+
+def test_decrypt_prefers_kid_match(rotated_keys):
+    new_envelope = encrypt_sealed_secret(SECRET)
+    assert new_envelope.startswith(f"fernet-v1:{key_id_for_fernet_key(KEY_B)}:")
+    assert decrypt_sealed_secret(new_envelope) == SECRET
+
+
+def test_decrypt_rejects_garbage_and_unknown_versions(rotated_keys):
+    with pytest.raises(SealedSecretDecryptionError):
+        decrypt_sealed_secret("not-an-envelope")
+    with pytest.raises(SealedSecretDecryptionError):
+        decrypt_sealed_secret("fernet-v9:0123abcd:QUJD")
+    with pytest.raises(SealedSecretDecryptionError):
+        decrypt_sealed_secret(encrypt_sealed_secret(SECRET)[:-4] + "AAAA")
+
+
+def test_resolve_sealed_secret_update_keep_vs_rotate():
+    assert resolve_sealed_secret_update(None, ENVELOPE) == ENVELOPE
+    assert resolve_sealed_secret_update("", ENVELOPE) == ENVELOPE
+    assert resolve_sealed_secret_update(ENVELOPE, None) == ENVELOPE
+    assert resolve_sealed_secret_update(None, None) is None
+
+
+# --- SealedSecret field type in forms ---
+
+
+class TypedSecretForm(FormPage):
+    username: str
+    password: SealedSecret
+
+
+class TypedOptionalSecretForm(FormPage):
+    username: str
+    password: SealedSecret | None = None
+
+
+def test_sealed_secret_field_encrypts_during_validation(sealed_keys):
+    form = TypedSecretForm(username="alice", password=SECRET)
+    dumped = form.model_dump()
+    assert is_sealed_envelope(dumped["password"])
+    assert SECRET not in dumped["password"]
+    assert dumped["username"] == "alice"
+
+
+def test_sealed_secret_field_rejects_empty_when_required(sealed_keys):
+    with pytest.raises(ValidationError):
+        TypedSecretForm(username="alice", password="")
+    with pytest.raises(ValidationError):
+        TypedSecretForm(username="alice", password=None)
+
+
+def test_sealed_secret_optional_null_means_keep(sealed_keys):
+    assert TypedOptionalSecretForm(username="alice", password=None).model_dump()["password"] is None
+    assert TypedOptionalSecretForm(username="alice").model_dump()["password"] is None
+
+
+def test_sealed_secret_optional_empty_string_rejected_loudly(sealed_keys):
+    with pytest.raises(ValidationError, match="sealed_secret_blank"):
+        TypedOptionalSecretForm(username="alice", password="")
+
+
+def test_sealed_secret_field_accepts_envelope_idempotently(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    form = TypedSecretForm(username="alice", password=envelope)
+    assert form.model_dump()["password"] == envelope
+
+
+def test_sealed_secret_field_fails_closed_when_disabled(monkeypatch):
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [])
+    with pytest.raises(ValidationError):
+        TypedSecretForm(username="alice", password=SECRET)
+
+
+def test_sealed_field_names_finds_typed_fields():
+    names, resolved = sealed_field_names(TypedSecretForm, {})
+    assert (names, resolved) == (frozenset({"password"}), True)
+    names, resolved = sealed_field_names(TypedOptionalSecretForm, {})
+    assert (names, resolved) == (frozenset({"password"}), True)
+
+
+# --- Settings validation ---
+
+
+def test_settings_rejects_too_many_keys():
+    keys = [SecretStr(Fernet.generate_key().decode()) for _ in range(3)]
+    with pytest.raises(ValueError, match="at most 2"):
+        AppSettings.validate_sealed_secrets_fernet_keys(keys)
+
+
+def test_settings_rejects_invalid_key():
+    with pytest.raises(ValueError, match="invalid Fernet key"):
+        AppSettings.validate_sealed_secrets_fernet_keys([SecretStr("not-a-key")])
+
+
+def test_settings_accepts_empty_and_valid_keys():
+    assert AppSettings.validate_sealed_secrets_fernet_keys([]) == []
+    keys = [SecretStr(KEY_A)]
+    assert AppSettings.validate_sealed_secrets_fernet_keys(keys) == keys
+
+
+# --- Summary masking ---
+
+
+def test_summary_masks_sealed_envelopes(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    values = _get_column_values({"name": "alice", "password": envelope}, {})
+    assert values == ["alice", SEALED_SUMMARY_MASK]
+    assert SECRET not in str(values)
+    assert envelope not in str(values)
+
+
+def test_summary_masks_envelopes_inside_lists(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    values = _get_column_values({"tokens": [envelope, "plain"]}, {})
+    assert values == [str([SEALED_SUMMARY_MASK, "plain"])]
+
+
+# --- Search index exclusion ---
+
+
+class IndexModel(BaseModel):
+    title: str
+    password: SealedSecret | None = None
+
+
+def test_traverse_skips_sealed_fields(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    fields = list(BaseTraverser.traverse(IndexModel(title="t", password=envelope), "root"))
+    paths = [field.path for field in fields]
+    assert "root.title" in paths
+    assert not [path for path in paths if "password" in path]
+    assert not any(SECRET in str(field.value) for field in fields)
+    assert not any(envelope in str(field.value) for field in fields)

@@ -22,6 +22,7 @@ from pydantic.fields import FieldInfo
 from orchestrator.core.forms import FormPage, SubmitFormPage
 from orchestrator.core.forms.summary_form.formatters import DEFAULT_FORMATTERS, Formatter
 from orchestrator.core.forms.validators import Divider, Label, MigrationSummary, migration_summary
+from orchestrator.core.forms.validators.sealed_secret import SEALED_SUMMARY_MASK, is_sealed_envelope
 from pydantic_forms.types import SummaryData
 from pydantic_forms.validators import callout, read_only_field
 
@@ -160,6 +161,12 @@ def _get_column_values(data: dict, options: BaseOptions) -> list[str]:
         field_value = data[field]
         if formatter := formatters.get(field):
             yield from (str(value) for _, value in formatter(field_value))
+        elif is_sealed_envelope(field_value):
+            # Sealed secrets are write-only: ciphertext must never be echoed in summary tables,
+            # regardless of author discipline upstream.
+            yield SEALED_SUMMARY_MASK
+        elif isinstance(field_value, list) and any(is_sealed_envelope(item) for item in field_value):
+            yield str([SEALED_SUMMARY_MASK if is_sealed_envelope(item) else item for item in field_value])
         else:
             match field_value:
                 case None | []:

@@ -43,6 +43,9 @@ EMBEDDING_DIMENSION_FIELD = Annotated[
     ),
 ]
 
+MAX_SEALED_SECRET_KEYS = 2
+"""Maximum live Fernet keys for sealed secrets: current plus one predecessor during rotation."""
+
 
 class ExecutorType(strEnum):
     WORKER = "celery"
@@ -122,6 +125,17 @@ class AppSettings(BaseSettings):
     EXPOSE_OAUTH_SETTINGS: bool = False
     LIFECYCLE_VALIDATION_MODE: LifecycleValidationMode = LifecycleValidationMode.LOOSE
     MCP_ENABLED: bool = False
+    SEALED_SECRETS_FERNET_KEYS: list[SecretStr] = Field(
+        default_factory=list,
+        description=(
+            "Ordered Fernet keys for sealed-secret form fields (newest first, max 2). "
+            "Each entry is a 44-char urlsafe-base64 Fernet key. Empty disables sealed secrets: "
+            "any form using SealedSecret then fails validation instead of storing plaintext. "
+            'Example (env var, JSON): SEALED_SECRETS_FERNET_KEYS=\'["<new-key>", "<old-key>"]\'. '
+            "Rotate by prepending the new key, deploying, then removing the old entry after the grace period. "
+            "History rows are never rewritten; old envelopes keep decrypting while their key is listed."
+        ),
+    )
     CELERY_TARGET_QUEUES: dict[Target, str] = Field(
         default_factory=dict,
         description=(
@@ -138,6 +152,23 @@ class AppSettings(BaseSettings):
     def validate_celery_target_queues(cls, value: dict[Target, str]) -> dict[Target, str]:
         if any(not queue.strip() for queue in value.values()):
             raise ValueError("CELERY_TARGET_QUEUES queue names must be non-empty")
+        return value
+
+    @field_validator("SEALED_SECRETS_FERNET_KEYS")
+    @classmethod
+    def validate_sealed_secrets_fernet_keys(cls, value: list[SecretStr]) -> list[SecretStr]:
+        from cryptography.fernet import Fernet
+
+        if len(value) > MAX_SEALED_SECRET_KEYS:
+            raise ValueError(
+                f"SEALED_SECRETS_FERNET_KEYS holds at most {MAX_SEALED_SECRET_KEYS} keys "
+                "(newest first, plus one predecessor during rotation)"
+            )
+        for key in value:
+            try:
+                Fernet(key.get_secret_value().encode())
+            except Exception:
+                raise ValueError("SEALED_SECRETS_FERNET_KEYS contains an invalid Fernet key") from None
         return value
 
 

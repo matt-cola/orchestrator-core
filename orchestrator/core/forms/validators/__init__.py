@@ -17,6 +17,15 @@ from orchestrator.core.forms.validators.customer_contact_list import customer_co
 from orchestrator.core.forms.validators.customer_id import CustomerId
 from orchestrator.core.forms.validators.display_subscription import DisplaySubscription
 from orchestrator.core.forms.validators.product_id import ProductId, ProductIdError, product_id
+from orchestrator.core.forms.validators.sealed_secret import (
+    SealedSecret,
+    SealedSecretDecryptionError,
+    SealedSecretsDisabledError,
+    decrypt_sealed_secret,
+    encrypt_sealed_secret,
+    is_sealed_envelope,
+    resolve_sealed_secret_update,
+)
 from pydantic_forms.types import strEnum
 from pydantic_forms.validators import (
     Accept,
@@ -57,7 +66,11 @@ __all__ = [
     "ProductId",
     "MigrationSummary",
     "OrganisationId",
+    "SealedSecret",
+    "SealedSecretDecryptionError",
+    "SealedSecretsDisabledError",
     "Timestamp",
+    "decrypt_sealed_secret",
     "migration_summary",
     "product_id",
     "remove_empty_items",
@@ -66,4 +79,7 @@ __all__ = [
     "unique_conlist",
     "VlanRanges",
     "customer_contact_list",
+    "encrypt_sealed_secret",
+    "is_sealed_envelope",
+    "resolve_sealed_secret_update",
 ]

@@ -29,6 +29,7 @@ from orchestrator.core.domain.base import ProductBlockModel, ProductModel
 from orchestrator.core.domain.lifecycle import (
     lookup_specialized_type,
 )
+from orchestrator.core.forms.validators.sealed_secret import is_sealed_secret_annotation
 from orchestrator.core.schemas.process import ProcessBaseSchema
 from orchestrator.core.schemas.workflow import WorkflowSchema
 from orchestrator.core.search.core.exceptions import ModelLoadError, ProductNotInRegistryError
@@ -64,6 +65,10 @@ class BaseTraverser(ABC):
         model_class = type(instance)
 
         for name, annotation in iter_model_field_annotations(model_class):
+            if is_sealed_secret_annotation(annotation):
+                # Sealed secrets are excluded from the search index: ciphertext must never be
+                # embedded or stored in index documents.
+                continue
             try:
                 value = getattr(instance, name, None)
             except Exception as e:

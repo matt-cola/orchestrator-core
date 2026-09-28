@@ -24,12 +24,16 @@ the values of sealed-secret fields, leaving every other field untouched for debu
 """
 
 import re
+from base64 import urlsafe_b64decode
 from collections.abc import Generator, Iterable
 from copy import deepcopy
-from typing import Any, get_args
+from hashlib import sha256
+from typing import Annotated, Any, get_args
 
 import structlog
-from pydantic import BaseModel
+from cryptography.fernet import Fernet, InvalidToken
+from pydantic import BaseModel, BeforeValidator, Field
+from pydantic_core import PydanticCustomError
 
 logger = structlog.get_logger(__name__)
 
@@ -50,6 +54,151 @@ SEALED_SUMMARY_MASK = "••••••"
 
 _MAX_GENERATOR_PAGES = 25
 """Upper bound when walking a form generator for redaction. Guards against pathological generators."""
+
+MAX_SEALED_PLAINTEXT_BYTES = 4096
+"""Largest accepted cleartext secret (UTF-8 bytes). Bounds DB row, RAM and log-pipeline exposure."""
+
+
+class SealedSecretsDisabledError(ValueError):
+    """Raised when a form uses SealedSecret but no Fernet key is configured.
+
+    Failing closed is deliberate: silently storing plaintext would violate the core guarantee.
+    """
+
+
+class SealedSecretDecryptionError(ValueError):
+    """Raised when an envelope cannot be decrypted with any configured key. Never carries the value."""
+
+
+def _configured_fernets() -> list[tuple[str, Fernet]]:
+    """Build (kid, Fernet) pairs from settings, newest first. Imported lazily to avoid import cycles."""
+    from orchestrator.core.settings import app_settings
+
+    pairs = []
+    for key in app_settings.SEALED_SECRETS_FERNET_KEYS:
+        raw = key.get_secret_value().encode()
+        kid = sha256(_fernet_key_bytes(raw)).hexdigest()[:8]
+        pairs.append((kid, Fernet(raw)))
+    return pairs
+
+
+def _fernet_key_bytes(raw: bytes) -> bytes:
+    """Decode a Fernet key to its 32 raw bytes (raises on invalid keys, which settings validation prevents)."""
+    return urlsafe_b64decode(raw)
+
+
+def key_id_for_fernet_key(raw_key: str) -> str:
+    """Derive the 8-hex envelope key id for a configured Fernet key string."""
+    return sha256(_fernet_key_bytes(raw_key.encode())).hexdigest()[:8]
+
+
+def encrypt_sealed_secret(plaintext: str) -> str:
+    """Fernet-encrypt ``plaintext`` and wrap it in a versioned envelope.
+
+    Args:
+        plaintext: The cleartext secret (bounded by :data:`MAX_SEALED_PLAINTEXT_BYTES`).
+
+    Returns:
+        A ``fernet-v1:<kid>:<token>`` envelope string, safe for JSONB/String storage.
+
+    Raises:
+        SealedSecretsDisabledError: When no Fernet key is configured.
+        ValueError: When the plaintext exceeds the size cap.
+    """
+    encoded = plaintext.encode("utf-8")
+    if len(encoded) > MAX_SEALED_PLAINTEXT_BYTES:
+        raise ValueError(f"Sealed secret exceeds {MAX_SEALED_PLAINTEXT_BYTES} bytes")
+    pairs = _configured_fernets()
+    if not pairs:
+        raise SealedSecretsDisabledError(
+            "Sealed secrets are disabled (SEALED_SECRETS_FERNET_KEYS is empty); refusing to store plaintext"
+        )
+    kid, fernet = pairs[0]
+    return f"{SEALED_ENVELOPE_VERSION}:{kid}:{fernet.encrypt(encoded).decode()}"
+
+
+def decrypt_sealed_secret(envelope: str) -> str:
+    """Decrypt a sealed envelope with the newest matching key.
+
+    Args:
+        envelope: A ``fernet-v1:<kid>:<token>`` string.
+
+    Returns:
+        The cleartext secret. Callers must use it immediately (e.g. a device API call) and never
+        log it or return it into workflow state.
+
+    Raises:
+        SealedSecretDecryptionError: On malformed envelopes, unknown key ids or invalid tokens.
+    """
+    pairs = _configured_fernets()
+    if not pairs:
+        raise SealedSecretDecryptionError("Sealed secrets are disabled")
+    try:
+        version, kid, token = envelope.split(":", 2)
+    except ValueError:
+        raise SealedSecretDecryptionError("Malformed sealed envelope") from None
+    if version != SEALED_ENVELOPE_VERSION or not token:
+        raise SealedSecretDecryptionError("Unsupported sealed envelope version")
+    ordered = sorted(pairs, key=lambda pair: 0 if pair[0] == kid else 1)
+    for _, fernet in ordered:
+        try:
+            return fernet.decrypt(token.encode()).decode("utf-8")
+        except InvalidToken:
+            continue
+    raise SealedSecretDecryptionError("Cannot decrypt sealed secret with any configured key")
+
+
+def resolve_sealed_secret_update(incoming: str | None, stored_envelope: str | None) -> str | None:
+    """Apply modify-workflow keep-vs-rotate semantics.
+
+    Args:
+        incoming: Validated form value (``None`` means "keep"; ``""`` is tolerated as keep for
+            non-validated paths, though the validator itself rejects empty strings loudly).
+        stored_envelope: Envelope currently persisted (subscription value or prior state).
+
+    Returns:
+        The envelope to persist: ``stored_envelope`` on blank, ``incoming`` on rotate.
+    """
+    if not incoming:
+        return stored_envelope
+    return incoming
+
+
+def _validate_sealed_secret(value: Any) -> Any:
+    """Pydantic ``BeforeValidator``.
+
+    ``None`` passes through (keep), envelopes pass through (idempotent), cleartext encrypts.
+    Runs during ``post_form`` validation, before anything is stored. Empty strings are rejected with an
+    actionable error instead of being silently kept: pydantic feeds union members the *original* input,
+    so a member-local ``""``-to-``None`` mapping could never make ``SealedSecret | None`` accept ``""``.
+    The keep semantic is therefore ``null``/omitted (which the UI submits for blank fields); ``""`` fails
+    loudly rather than risking an ambiguous store.
+    """
+    if value is None:
+        return None
+    if value == "":
+        raise PydanticCustomError(
+            "sealed_secret_blank",
+            "Blank sealed secrets must be submitted as null (keep the stored value); empty strings are rejected",
+        )
+    if not isinstance(value, str):
+        return value
+    if is_sealed_envelope(value):
+        return value
+    return encrypt_sealed_secret(value)
+
+
+SealedSecret = Annotated[
+    str,
+    Field(json_schema_extra={"format": SEALED_SECRET_FORMAT, "writeOnly": True}),
+    BeforeValidator(_validate_sealed_secret),
+]
+"""Secret form field: password widget in the UI, Fernet envelope in the DB.
+
+Declare required secrets as ``field: SealedSecret`` (blank and null are rejected) and modify-workflow
+secrets as ``field: SealedSecret | None = None`` (``null``/omitted means "keep the stored value", a
+value means "rotate"). Empty strings are always rejected — clients must send ``null`` for keep.
+"""
 
 
 def is_sealed_envelope(value: object) -> bool:
