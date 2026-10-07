@@ -17,20 +17,25 @@ Covers title resolution from fields, query construction with/without entity_id,
 and registry completeness.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
+from uuid import UUID
 
 import pytest
 
-from orchestrator.core.db import ProcessTable, SubscriptionTable
+from orchestrator.core.db import ProcessTable, ProductBlockTable, ResourceTypeTable, SubscriptionTable
 from orchestrator.core.search.core.types import EntityType, ExtractedField, FieldType
 from orchestrator.core.search.indexing.registry import (
     ENTITY_CONFIG_REGISTRY,
     EntityConfig,
     ProcessConfig,
+    ProductBlockConfig,
+    ResourceTypeConfig,
     WorkflowConfig,
 )
 from orchestrator.core.search.indexing.traverse import (
     ProcessTraverser,
+    ProductBlockTraverser,
+    ResourceTypeTraverser,
     SubscriptionTraverser,
     WorkflowTraverser,
 )
@@ -48,7 +53,6 @@ VALID_UUID = "12345678-1234-1234-1234-123456789abc"
 def _make_config(title_paths: list[str]) -> EntityConfig:
     """Return a minimal EntityConfig with the given title_paths using a MagicMock table."""
     mock_table = MagicMock()
-    mock_table.query = MagicMock()
     return EntityConfig(
         entity_kind=EntityType.SUBSCRIPTION,
         table=mock_table,
@@ -109,48 +113,27 @@ def test_get_title_from_fields(title_paths, fields, expected):
 # ---------------------------------------------------------------------------
 
 
-def test_entity_config_get_all_query_without_entity_id():
-    mock_table = MagicMock()
-    base_query = MagicMock()
-    mock_table.query = base_query
-
+@pytest.mark.parametrize(
+    ("entity_id", "expected_params"),
+    [
+        pytest.param(None, {}, id="without_entity_id"),
+        pytest.param(VALID_UUID, {"subscription_id_1": UUID(VALID_UUID)}, id="with_entity_id"),
+    ],
+)
+def test_entity_config_get_all_query(entity_id, expected_params):
     config = EntityConfig(
         entity_kind=EntityType.SUBSCRIPTION,
-        table=mock_table,
+        table=SubscriptionTable,
         traverser=MagicMock(),
         pk_name="subscription_id",
         root_name="subscription",
         title_paths=[],
     )
 
-    result = config.get_all_query()
+    stmt = config.get_all_query(entity_id=entity_id)
 
-    assert result is base_query
-    base_query.filter.assert_not_called()
-
-
-def test_entity_config_get_all_query_with_entity_id():
-    mock_table = MagicMock()
-    base_query = MagicMock()
-    filtered_query = MagicMock()
-    pk_column = MagicMock()
-    base_query.filter.return_value = filtered_query
-    mock_table.query = base_query
-    mock_table.subscription_id = pk_column
-
-    config = EntityConfig(
-        entity_kind=EntityType.SUBSCRIPTION,
-        table=mock_table,
-        traverser=MagicMock(),
-        pk_name="subscription_id",
-        root_name="subscription",
-        title_paths=[],
-    )
-
-    result = config.get_all_query(entity_id=VALID_UUID)
-
-    assert result is filtered_query
-    base_query.filter.assert_called_once()
+    assert stmt.column_descriptions[0]["entity"] is SubscriptionTable
+    assert stmt.compile().params == expected_params
 
 
 # ---------------------------------------------------------------------------
@@ -159,52 +142,70 @@ def test_entity_config_get_all_query_with_entity_id():
 
 
 def test_process_config_applies_selectinload_on_workflow():
-    mock_table = MagicMock(spec=ProcessTable)
-    base_query = MagicMock()
-    options_query = MagicMock()
-    mock_table.query = base_query
-    base_query.options.return_value = options_query
-
     config = ProcessConfig(
         entity_kind=EntityType.PROCESS,
-        table=mock_table,
+        table=ProcessTable,
         traverser=MagicMock(),
         pk_name="process_id",
         root_name="process",
         title_paths=[],
     )
 
-    with patch("sqlalchemy.orm.selectinload") as mock_selectinload:
+    select_result = MagicMock()
+    options_result = MagicMock()
+    select_result.options.return_value = options_result
+
+    with (
+        patch("orchestrator.core.search.indexing.registry.select", return_value=select_result) as mock_select,
+        patch("sqlalchemy.orm.selectinload") as mock_selectinload,
+    ):
         result = config.get_all_query()
 
-    mock_selectinload.assert_called_once_with(ProcessTable.workflow)
-    base_query.options.assert_called_once()
-    assert result is options_query
+    mock_select.assert_called_once_with(ProcessTable)
+    mock_selectinload.assert_has_calls(
+        [call(ProcessTable.workflow), call(ProcessTable.process_subscriptions)], any_order=True
+    )
+    select_result.options.assert_called_once()
+    assert result is options_result
 
 
-def test_process_config_with_entity_id_applies_filter():
-    mock_table = MagicMock(spec=ProcessTable)
-    base_query = MagicMock()
-    options_query = MagicMock()
-    filtered_query = MagicMock()
-    mock_table.query = base_query
-    base_query.options.return_value = options_query
-    options_query.filter.return_value = filtered_query
+# ---------------------------------------------------------------------------
+# ProcessConfig, ProductBlockConfig, ResourceTypeConfig: get_all_query(entity_id=...)
+# ---------------------------------------------------------------------------
 
-    config = ProcessConfig(
+
+@pytest.mark.parametrize(
+    ("config_cls", "table", "pk_name", "root_name"),
+    [
+        pytest.param(ProcessConfig, ProcessTable, "process_id", "process", id="process"),
+        pytest.param(ProductBlockConfig, ProductBlockTable, "product_block_id", "product_block", id="product_block"),
+        pytest.param(ResourceTypeConfig, ResourceTypeTable, "resource_type_id", "resource_type", id="resource_type"),
+    ],
+)
+def test_select_options_where_config_with_entity_id_applies_where(config_cls, table, pk_name, root_name):
+    mock_table = MagicMock(spec=table)
+    setattr(mock_table, pk_name, MagicMock())
+
+    config = config_cls(
         entity_kind=EntityType.PROCESS,
         table=mock_table,
         traverser=MagicMock(),
-        pk_name="process_id",
-        root_name="process",
+        pk_name=pk_name,
+        root_name=root_name,
         title_paths=[],
     )
 
-    with patch("sqlalchemy.orm.selectinload"):
+    select_result = MagicMock()
+    options_result = MagicMock()
+    where_result = MagicMock()
+    select_result.options.return_value = options_result
+    options_result.where.return_value = where_result
+
+    with patch("orchestrator.core.search.indexing.registry.select", return_value=select_result), patch("sqlalchemy.orm.selectinload"):
         result = config.get_all_query(entity_id=VALID_UUID)
 
-    options_query.filter.assert_called_once()
-    assert result is filtered_query
+    options_result.where.assert_called_once()
+    assert result is where_result
 
 
 # ---------------------------------------------------------------------------
@@ -283,3 +284,86 @@ def test_registry_workflow_config_fields():
     assert config.pk_name == "workflow_id"
     assert config.root_name == "workflow"
     assert config.traverser is WorkflowTraverser
+
+
+def test_registry_product_block_config_fields():
+    config = ENTITY_CONFIG_REGISTRY[EntityType.PRODUCT_BLOCK]
+    assert config.pk_name == "product_block_id"
+    assert config.root_name == "product_block"
+    assert config.table is ProductBlockTable
+    assert config.traverser is ProductBlockTraverser
+
+
+def test_registry_resource_type_config_fields():
+    config = ENTITY_CONFIG_REGISTRY[EntityType.RESOURCE_TYPE]
+    assert config.pk_name == "resource_type_id"
+    assert config.root_name == "resource_type"
+    assert config.table is ResourceTypeTable
+    assert config.traverser is ResourceTypeTraverser
+
+
+# ---------------------------------------------------------------------------
+# ProductBlockConfig.get_all_query
+# ---------------------------------------------------------------------------
+
+
+def test_product_block_config_applies_selectinload_on_resource_types_and_in_use_by():
+    config = ProductBlockConfig(
+        entity_kind=EntityType.PRODUCT_BLOCK,
+        table=ProductBlockTable,
+        traverser=MagicMock(),
+        pk_name="product_block_id",
+        root_name="product_block",
+        title_paths=[],
+    )
+
+    select_result = MagicMock()
+    options_result = MagicMock()
+    select_result.options.return_value = options_result
+
+    with (
+        patch("orchestrator.core.search.indexing.registry.select", return_value=select_result) as mock_select,
+        patch("sqlalchemy.orm.selectinload") as mock_selectinload,
+    ):
+        result = config.get_all_query()
+
+    mock_select.assert_called_once_with(ProductBlockTable)
+    mock_selectinload.assert_has_calls(
+        [call(ProductBlockTable.resource_types), call(ProductBlockTable.in_use_by_block_relations)],
+        any_order=True,
+    )
+    select_result.options.assert_called_once()
+    assert result is options_result
+
+
+# ---------------------------------------------------------------------------
+# ResourceTypeConfig.get_all_query
+# ---------------------------------------------------------------------------
+
+
+def test_resource_type_config_applies_selectinload_on_product_blocks():
+    config = ResourceTypeConfig(
+        entity_kind=EntityType.RESOURCE_TYPE,
+        table=ResourceTypeTable,
+        traverser=MagicMock(),
+        pk_name="resource_type_id",
+        root_name="resource_type",
+        title_paths=[],
+    )
+
+    select_result = MagicMock()
+    options_result = MagicMock()
+    selectinload_result = MagicMock()
+    select_result.options.return_value = options_result
+
+    with (
+        patch("orchestrator.core.search.indexing.registry.select", return_value=select_result) as mock_select,
+        patch("sqlalchemy.orm.selectinload", return_value=selectinload_result) as mock_selectinload,
+    ):
+        result = config.get_all_query()
+
+    mock_select.assert_called_once_with(ResourceTypeTable)
+    mock_selectinload.assert_called_once_with(ResourceTypeTable.product_blocks)
+    selectinload_result.noload.assert_called_once_with("*")
+    select_result.options.assert_called_once_with(selectinload_result.noload.return_value)
+    assert result is options_result

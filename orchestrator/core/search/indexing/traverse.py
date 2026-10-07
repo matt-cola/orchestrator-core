@@ -20,7 +20,14 @@ from uuid import uuid4
 
 import structlog
 
-from orchestrator.core.db import ProcessTable, ProductTable, SubscriptionTable, WorkflowTable
+from orchestrator.core.db import (
+    ProcessTable,
+    ProductBlockTable,
+    ProductTable,
+    ResourceTypeTable,
+    SubscriptionTable,
+    WorkflowTable,
+)
 from orchestrator.core.domain import (
     SUBSCRIPTION_MODEL_REGISTRY,
     SubscriptionModel,
@@ -30,16 +37,20 @@ from orchestrator.core.domain.lifecycle import (
     lookup_specialized_type,
 )
 from orchestrator.core.forms.validators.sealed_secret import is_sealed_secret_annotation
-from orchestrator.core.schemas.process import ProcessBaseSchema
 from orchestrator.core.schemas.workflow import WorkflowSchema
 from orchestrator.core.search.core.exceptions import ModelLoadError, ProductNotInRegistryError
 from orchestrator.core.search.core.types import LTREE_SEPARATOR, ExtractedField, FieldType
 from orchestrator.core.search.indexing.schema import iter_model_field_annotations
+from orchestrator.core.search.schemas.process import ProcessIndexSchema
+from orchestrator.core.search.schemas.product_block import ProductBlockIndexSchema
+from orchestrator.core.search.schemas.resource_type import ResourceTypeIndexSchema
 from orchestrator.core.types import SubscriptionLifecycle
 
 logger = structlog.get_logger(__name__)
 
-DatabaseEntity = SubscriptionTable | ProductTable | ProcessTable | WorkflowTable
+DatabaseEntity = (
+    SubscriptionTable | ProductTable | ProcessTable | WorkflowTable | ProductBlockTable | ResourceTypeTable
+)
 
 
 class BaseTraverser(ABC):
@@ -308,7 +319,7 @@ class ProductTraverser(BaseTraverser):
 
 
 class ProcessTraverser(BaseTraverser):
-    """Traverser for process entities using ProcessBaseSchema.
+    """Traverser for process entities using ProcessIndexSchema.
 
     Only indexes top-level process fields (no subscriptions or steps)
     to keep the index size manageable.
@@ -317,16 +328,14 @@ class ProcessTraverser(BaseTraverser):
     EXCLUDED_FIELDS = {"traceback", "failed_reason"}
 
     @classmethod
-    def _load_model(cls, entity: ProcessTable) -> ProcessBaseSchema | None:
-        return cls._load_model_with_schema(entity, ProcessBaseSchema, "process_id")
+    def _load_model(cls, entity: ProcessTable) -> ProcessIndexSchema:
+        return cls._load_model_with_schema(entity, ProcessIndexSchema, "process_id")
 
     @classmethod
     def get_fields(cls, entity: ProcessTable, pk_name: str, root_name: str) -> list[ExtractedField]:  # type: ignore[override]
         """Extract fields from process, excluding fields in EXCLUDED_FIELDS."""
         try:
             model = cls._load_model(entity)
-            if model is None:
-                return []
 
             return sorted(
                 (
@@ -355,3 +364,21 @@ class WorkflowTraverser(BaseTraverser):
     def _load_model(cls, workflow: WorkflowTable) -> WorkflowSchema:
         """Load workflow model using WorkflowSchema."""
         return cls._load_model_with_schema(workflow, WorkflowSchema, "workflow_id")
+
+
+class ProductBlockTraverser(BaseTraverser):
+    """Traverser for product block *definitions* (never instance data) using ProductBlockIndexSchema."""
+
+    @classmethod
+    def _load_model(cls, product_block: ProductBlockTable) -> ProductBlockIndexSchema:
+        """Load product block model using ProductBlockIndexSchema."""
+        return cls._load_model_with_schema(product_block, ProductBlockIndexSchema, "product_block_id")
+
+
+class ResourceTypeTraverser(BaseTraverser):
+    """Traverser for resource type definitions (never instance data) using ResourceTypeIndexSchema."""
+
+    @classmethod
+    def _load_model(cls, resource_type: ResourceTypeTable) -> ResourceTypeIndexSchema:
+        """Load resource type model using ResourceTypeIndexSchema."""
+        return cls._load_model_with_schema(resource_type, ResourceTypeIndexSchema, "resource_type_id")

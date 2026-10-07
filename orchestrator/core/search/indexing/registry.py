@@ -15,12 +15,14 @@ from dataclasses import dataclass
 from typing import Generic, TypeVar
 from uuid import UUID
 
-from sqlalchemy.orm import Query
+from sqlalchemy import select
 from sqlalchemy.sql import Select
 
 from orchestrator.core.db import (
     ProcessTable,
+    ProductBlockTable,
     ProductTable,
+    ResourceTypeTable,
     SubscriptionTable,
     WorkflowTable,
 )
@@ -29,7 +31,9 @@ from orchestrator.core.search.core.types import EntityType, ExtractedField
 from orchestrator.core.search.indexing.traverse import (
     BaseTraverser,
     ProcessTraverser,
+    ProductBlockTraverser,
     ProductTraverser,
+    ResourceTypeTraverser,
     SubscriptionTraverser,
     WorkflowTraverser,
 )
@@ -49,11 +53,11 @@ class EntityConfig(Generic[ModelT]):
     root_name: str
     title_paths: list[str]  # List of field paths to check for title (with fallback)
 
-    def get_all_query(self, entity_id: str | None = None) -> Query | Select:
-        query = self.table.query
+    def get_all_query(self, entity_id: str | None = None) -> Select:
+        query = select(self.table)
         if entity_id:
             pk_column = getattr(self.table, self.pk_name)
-            query = query.filter(pk_column == UUID(entity_id))
+            query = query.where(pk_column == UUID(entity_id))
         return query
 
     def get_title_from_fields(self, fields: list[ExtractedField]) -> str:
@@ -67,16 +71,24 @@ class EntityConfig(Generic[ModelT]):
 
 @dataclass(frozen=True)
 class ProcessConfig(EntityConfig[ProcessTable]):
-    """Processes need to eager load workflow for workflow_name field."""
+    """Processes need to eager load workflow (for workflow_name/workflow_target) and linked subscriptions."""
 
-    def get_all_query(self, entity_id: str | None = None) -> Query | Select:
+    def get_all_query(self, entity_id: str | None = None) -> Select:
         from sqlalchemy.orm import selectinload
 
-        # Only load workflow, not subscriptions (keeps it lightweight)
-        query = self.table.query.options(selectinload(ProcessTable.workflow))
+        from orchestrator.core.db import ProcessSubscriptionTable, SubscriptionTable
+
+        # Loads workflow, subscriptions and product, and skips steps and product blocks
+        # to keep the index lightweight.
+        query = select(self.table).options(
+            selectinload(self.table.workflow),
+            selectinload(self.table.process_subscriptions)
+            .selectinload(ProcessSubscriptionTable.subscription)
+            .selectinload(SubscriptionTable.product),
+        )
         if entity_id:
             pk_column = getattr(self.table, self.pk_name)
-            query = query.filter(pk_column == UUID(entity_id))
+            query = query.where(pk_column == UUID(entity_id))
         return query
 
 
@@ -86,6 +98,41 @@ class WorkflowConfig(EntityConfig[WorkflowTable]):
 
     def get_all_query(self, entity_id: str | None = None) -> Select:
         query = self.table.select()
+        if entity_id:
+            pk_column = getattr(self.table, self.pk_name)
+            query = query.where(pk_column == UUID(entity_id))
+        return query
+
+
+@dataclass(frozen=True)
+class ProductBlockConfig(EntityConfig[ProductBlockTable]):
+    """Product blocks need to eager load resource_types and in_use_by product_blocks."""
+
+    def get_all_query(self, entity_id: str | None = None) -> Select:
+        from sqlalchemy.orm import selectinload
+
+        from orchestrator.core.db.models import ProductBlockRelationTable
+
+        query = select(self.table).options(
+            selectinload(self.table.resource_types),
+            selectinload(self.table.in_use_by_block_relations).selectinload(ProductBlockRelationTable.in_use_by),
+            selectinload(self.table.depends_on_block_relations).selectinload(ProductBlockRelationTable.depends_on),
+        )
+        if entity_id:
+            pk_column = getattr(self.table, self.pk_name)
+            query = query.where(pk_column == UUID(entity_id))
+        return query
+
+
+@dataclass(frozen=True)
+class ResourceTypeConfig(EntityConfig[ResourceTypeTable]):
+    """Resource types need to eager load the product blocks that use them."""
+
+    def get_all_query(self, entity_id: str | None = None) -> Select:
+        from sqlalchemy.orm import selectinload
+
+        # noload to prevent lazyloading of product_blocks relations
+        query = select(self.table).options(selectinload(self.table.product_blocks).noload("*"))
         if entity_id:
             pk_column = getattr(self.table, self.pk_name)
             query = query.where(pk_column == UUID(entity_id))
@@ -124,5 +171,21 @@ ENTITY_CONFIG_REGISTRY: dict[EntityType, EntityConfig] = {
         pk_name="workflow_id",
         root_name="workflow",
         title_paths=["workflow.description", "workflow.name"],
+    ),
+    EntityType.PRODUCT_BLOCK: ProductBlockConfig(
+        entity_kind=EntityType.PRODUCT_BLOCK,
+        table=ProductBlockTable,
+        traverser=ProductBlockTraverser,
+        pk_name="product_block_id",
+        root_name="product_block",
+        title_paths=["product_block.description", "product_block.name"],
+    ),
+    EntityType.RESOURCE_TYPE: ResourceTypeConfig(
+        entity_kind=EntityType.RESOURCE_TYPE,
+        table=ResourceTypeTable,
+        traverser=ResourceTypeTraverser,
+        pk_name="resource_type_id",
+        root_name="resource_type",
+        title_paths=["resource_type.description", "resource_type.resource_type"],
     ),
 }

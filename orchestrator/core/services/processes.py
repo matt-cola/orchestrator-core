@@ -20,6 +20,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import structlog
+from deepmerge.merger import Merger
+from deprecated import deprecated
 from pytz import utc
 from requests.adapters import MaxRetryError
 from sqlalchemy import delete, select
@@ -95,6 +97,19 @@ def merge_state(base: State, nxt: State) -> State:
         for k, v in nxt.items()
     }
 
+
+class _DeprecatedStateMerger(Merger):
+    @deprecated(
+        reason=(
+            "StateMerger is deprecated in favor of the pure `merge_state()` function and will be removed in "
+            "6.0.0. See https://workfloworchestrator.org/orchestrator-core/guides/upgrading/5.5/"
+        )
+    )
+    def merge(self, base: State, nxt: State) -> State:  # type: ignore[override]
+        return super().merge(base, nxt)
+
+
+StateMerger = _DeprecatedStateMerger([(dict, ["merge"])], ["override"], ["override"])
 
 ProcessHandlerFunc = Callable[[ProcessTable, WFProcess], ProcessTable]
 

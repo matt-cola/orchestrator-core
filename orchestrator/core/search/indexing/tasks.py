@@ -15,7 +15,6 @@ from typing import Any
 
 import structlog
 from sqlalchemy import func, select, text
-from sqlalchemy.orm import Query
 
 from orchestrator.core.db import db
 from orchestrator.core.domain.context_cache import cache_subscription_models
@@ -64,13 +63,7 @@ def run_indexing_for_entity(
     """
     config = ENTITY_CONFIG_REGISTRY[entity_kind]
 
-    q = config.get_all_query(entity_id)
-
-    if isinstance(q, Query):
-        q = q.enable_eagerloads(False)
-        stmt = q.statement
-    else:
-        stmt = q
+    stmt = config.get_all_query(entity_id)
 
     total_count = _get_entity_count(stmt) if show_progress else None
 
@@ -88,6 +81,18 @@ def run_indexing_for_entity(
 
     with cache_subscription_models():
         indexer.run(entities)
+
+
+def run_indexing_for_all_entities(force_index: bool = False) -> None:
+    """Index every registered entity type, then resynchronize the distinct-paths table.
+
+    Unchanged fields are skipped via the hash cache, so this is cheap to run after every
+    migration unless `force_index` is set.
+    """
+    for entity_kind in ENTITY_CONFIG_REGISTRY:
+        logger.info("Indexing entities", entity_kind=entity_kind.value)
+        run_indexing_for_entity(entity_kind=entity_kind, force_index=force_index)
+    rebuild_search_paths()
 
 
 def rebuild_search_paths() -> None:
