@@ -213,6 +213,8 @@ nav:
       - Search: reference-docs/search.md
       - AI / Hybrid Search: reference-docs/ai-search.md
       - MCP Server: reference-docs/mcp.md
+      - Security:
+          - Sealed Secrets: reference-docs/sealed-secrets.md
       - Monitoring:
           - Error Tracking: reference-docs/monitoring/error-tracking.md
           - Metrics: reference-docs/monitoring/metrics.md
