@@ -144,9 +144,7 @@ return 404; undecryptable envelopes return 422.
   carries field input values.
 - A compromised key reads all rows sealed under it. Keep the ring at 1–2 keys, keep keys out of
   backups and log pipelines, and never expose `SEALED_SECRETS_FERNET_KEYS` via settings endpoints.
-- Envelopes leak approximate plaintext length if exfiltrated from the database —
-  keep keys out of backups and log pipelines, and never expose
-  `SEALED_SECRETS_FERNET_KEYS` via settings endpoints. API list/detail payloads
-  are masked (`••••••`); use the audited `POST .../reveal` for one-off display.
+  API list/detail payloads are masked (`••••••`); use the audited `POST .../reveal` for one-off display.
+  Note envelopes encode approximate plaintext length, so treat exfiltrated ciphertext as sensitive.
 - Workflow authors can still footgun by logging a decrypted value or returning it into state.
   Decrypt late, use immediately, drop the reference.
