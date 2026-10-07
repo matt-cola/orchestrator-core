@@ -14,6 +14,8 @@ uv run mypy orchestrator               # type check
 uv run ruff check orchestrator         # lint
 uv run ruff format orchestrator        # format
 pre-commit run --all-files             # format, lint, type check.
+uv run orchestrator secrets rewrap-sealed-secrets --check    # sealed-secret rotation census
+uv run orchestrator secrets rewrap-sealed-secrets --execute  # rewrap current values to newest key
 ```
 
 ## Code Style

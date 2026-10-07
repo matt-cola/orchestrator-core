@@ -101,3 +101,16 @@ class SubscriptionDomainModelSchema(SubscriptionSchema):
     customer_descriptions: list[SubscriptionDescriptionSchema | None] = []  # type: ignore
     product: ProductBaseSchema
     model_config = ConfigDict(extra="allow")
+
+
+class SealedSecretRevealRequest(OrchestratorBaseModel):
+    """Request to reveal one sealed value. Path is dot-separated (e.g. ``block.password``)."""
+
+    path: str
+
+
+class SealedSecretRevealResponse(OrchestratorBaseModel):
+    """Decrypted secret. Returned once; callers must not log or persist it."""
+
+    value: str
+    sensitive: bool = True

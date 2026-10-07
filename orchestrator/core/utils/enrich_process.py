@@ -15,6 +15,7 @@
 from more_itertools import first
 
 from orchestrator.core.db import ProcessStepTable, ProcessTable, SubscriptionTable
+from orchestrator.core.forms.validators.sealed_secret import mask_sealed_envelopes
 from orchestrator.core.utils.get_updated_properties import get_dict_updates
 from orchestrator.core.workflow import ProcessStat, Step, StepStatus
 from pydantic_forms.core import generate_form
@@ -61,11 +62,11 @@ def enrich_step_details(step: ProcessStepTable, previous_step: ProcessStepTable 
         "started": step.started_at.timestamp(),
         "completed": step.completed_at.timestamp(),
         "status": step.status,
-        "state": step.state,
+        "state": mask_sealed_envelopes(step.state),
         "created_by": step.created_by,
         "step_id": step.step_id,
         "stepid": step.step_id,
-        "state_delta": state_delta,
+        "state_delta": mask_sealed_envelopes(state_delta),
     }
 
 
@@ -84,7 +85,7 @@ def enrich_process_details(process: ProcessTable, p_stat: ProcessStat) -> dict:
     return {
         "steps": dict_steps,
         "form": generated_form,
-        "current_state": current_state,
+        "current_state": mask_sealed_envelopes(current_state),
     }
 
 

@@ -41,7 +41,12 @@ from orchestrator.core.db import (
 )
 from orchestrator.core.mcp.server import AGENT_EXPOSED_TAG, READONLY_TOOL
 from orchestrator.core.schemas import SubscriptionWorkflowListsSchema
-from orchestrator.core.schemas.subscription import SubscriptionDomainModelSchema, SubscriptionWithMetadata
+from orchestrator.core.schemas.subscription import (
+    SealedSecretRevealRequest,
+    SealedSecretRevealResponse,
+    SubscriptionDomainModelSchema,
+    SubscriptionWithMetadata,
+)
 from orchestrator.core.security import authenticate
 from orchestrator.core.services.subscriptions import (
     format_extended_domain_model,
@@ -236,3 +241,73 @@ async def subscription_set_in_sync(
         raise_status(HTTPStatus.NOT_FOUND, str(e))
     except DBInternalError:
         raise_status(HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+@router.post(
+    "/{subscription_id}/reveal",
+    response_model=SealedSecretRevealResponse,
+    status_code=HTTPStatus.OK,
+)
+async def subscription_reveal_sealed_secret(
+    subscription_id: UUID,
+    body: SealedSecretRevealRequest,
+    current_user: OIDCUserModel | None = Depends(authenticate),
+) -> SealedSecretRevealResponse:
+    """Reveal one sealed value. Mask-by-default; envelopes never leave the server otherwise.
+
+    Resolves ``body.path`` (dot-separated, e.g. ``block.password``) against the
+    unmasked domain model, decrypts the envelope server-side and returns the
+    cleartext once. Audit-logged with ids and key id only — never the value.
+    """
+    from orchestrator.core.api.helpers import getattr_in
+    from orchestrator.core.domain.base import SubscriptionModel
+    from orchestrator.core.forms.validators.sealed_secret import (
+        SealedSecretDecryptionError,
+        decrypt_sealed_secret,
+        is_sealed_envelope,
+    )
+    from orchestrator.core.services.sealed_secrets import envelope_kid
+    from orchestrator.core.services.subscriptions import build_domain_model
+
+    if not body.path or not body.path.strip():
+        raise_status(HTTPStatus.UNPROCESSABLE_ENTITY, "Path must be a non-empty dot-separated string")
+
+    def _load_unmasked() -> dict[str, Any]:
+        model = SubscriptionModel.from_subscription(subscription_id)
+        return build_domain_model(model)
+
+    from fastapi.exceptions import HTTPException
+
+    try:
+        unmasked = await run_in_threadpool(_load_unmasked)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise_status(HTTPStatus.NOT_FOUND, str(e))
+    except Exception as e:  # noqa: BLE001 - surface unexpected load failures as 500
+        raise_status(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    envelope = getattr_in(unmasked, body.path.strip())
+    if not isinstance(envelope, str) or not is_sealed_envelope(envelope):
+        raise_status(HTTPStatus.NOT_FOUND, "No sealed value at path")
+    kid = envelope_kid(envelope)
+    try:
+        plaintext = decrypt_sealed_secret(envelope)
+    except SealedSecretDecryptionError as e:
+        logger.warning(
+            "Sealed secret reveal failed",
+            subscription_id=str(subscription_id),
+            path=body.path,
+            kid=kid,
+            user=str(current_user),
+            error=str(e),
+        )
+        raise_status(HTTPStatus.UNPROCESSABLE_ENTITY, "Cannot decrypt sealed value with any configured key")
+    logger.info(
+        "Sealed secret revealed",
+        subscription_id=str(subscription_id),
+        path=body.path,
+        kid=kid,
+        user=str(current_user),
+    )
+    return SealedSecretRevealResponse(value=plaintext)

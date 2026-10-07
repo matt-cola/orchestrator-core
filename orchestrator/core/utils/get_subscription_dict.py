@@ -14,11 +14,18 @@
 from uuid import UUID
 
 from orchestrator.core.domain.base import SubscriptionModel
+from orchestrator.core.forms.validators.sealed_secret import mask_sealed_envelopes
 from orchestrator.core.services.subscriptions import _generate_etag, build_domain_model, build_extended_domain_model
 
 
 async def get_subscription_dict(subscription_id: UUID, inject_inuseby: bool = True) -> tuple[dict, str]:
-    """Helper function to get subscription dict by uuid from db or cache."""
+    """Helper function to get subscription dict by uuid from db or cache.
+
+    Sealed envelopes are masked here so REST domain-model, GraphQL detail and
+    any other presentation consumer never receive ciphertext. Workflow steps
+    needing cleartext use ``SubscriptionModel.from_subscription`` directly
+    and decrypt server-side.
+    """
 
     subscription_model = SubscriptionModel.from_subscription(subscription_id)
 
@@ -26,5 +33,6 @@ async def get_subscription_dict(subscription_id: UUID, inject_inuseby: bool = Tr
         subscription = build_domain_model(subscription_model)
     else:
         subscription = build_extended_domain_model(subscription_model)
+    subscription = mask_sealed_envelopes(subscription)
     etag = _generate_etag(subscription)
     return subscription, etag

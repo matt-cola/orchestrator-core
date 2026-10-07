@@ -517,3 +517,46 @@ def test_traverse_skips_sealed_fields(sealed_keys):
     assert not [path for path in paths if "password" in path]
     assert not any(SECRET in str(field.value) for field in fields)
     assert not any(envelope in str(field.value) for field in fields)
+
+
+# --- API presentation masking ---
+
+
+def test_mask_sealed_envelopes_replaces_envelopes_at_any_depth(sealed_keys):
+    from orchestrator.core.forms.validators.sealed_secret import mask_sealed_envelopes
+
+    envelope = encrypt_sealed_secret(SECRET)
+    payload = {
+        "username": "alice",
+        "password": envelope,
+        "nested": {"token": envelope, "label": "keep"},
+        "items": [envelope, "plain", {"pw": envelope}],
+        "count": 3,
+        "nothing": None,
+    }
+    masked = mask_sealed_envelopes(payload)
+    assert masked["username"] == "alice"
+    assert masked["password"] == SEALED_SUMMARY_MASK
+    assert masked["nested"] == {"token": SEALED_SUMMARY_MASK, "label": "keep"}
+    assert masked["items"][0] == SEALED_SUMMARY_MASK
+    assert masked["items"][1] == "plain"
+    assert masked["items"][2] == {"pw": SEALED_SUMMARY_MASK}
+    assert masked["count"] == 3
+    assert masked["nothing"] is None
+    # Cleartext is not an envelope: never masked here (redaction handles cleartext on error paths)
+    assert mask_sealed_envelopes({"password": SECRET}) == {"password": SECRET}
+    # Input never mutated
+    assert payload["password"] == envelope
+
+
+def test_mask_sealed_envelopes_handles_tuples_and_empty(sealed_keys):
+    from orchestrator.core.forms.validators.sealed_secret import mask_sealed_envelopes
+
+    envelope = encrypt_sealed_secret(SECRET)
+    assert mask_sealed_envelopes(envelope) == SEALED_SUMMARY_MASK
+    assert mask_sealed_envelopes(SECRET) == SECRET
+    assert mask_sealed_envelopes(None) is None
+    assert mask_sealed_envelopes({}) == {}
+    assert mask_sealed_envelopes([]) == []
+    masked_tuple = mask_sealed_envelopes((envelope, "plain"))
+    assert tuple(masked_tuple) == (SEALED_SUMMARY_MASK, "plain")

@@ -111,6 +111,25 @@ There is intentionally no scheduled re-encryption task: a timer that decrypts ev
 maximizes key exposure for no functional benefit. The command above is manual and audit-logged with
 key-id counts and row/process ids only — it never prints secret values.
 
+## API presentation
+
+Subscription domain-model (`GET /subscriptions/domain-model/{id}`, GraphQL detail)
+and process detail (`current_state`, step `state`/`state_delta`) mask every
+envelope as `••••••`. Envelopes never leave the server in list/detail payloads.
+
+To display a secret (e.g. click-to-demask in the UI), call the audited reveal:
+
+```http
+POST /api/subscriptions/{id}/reveal
+{"path": "block.password"}
+```
+
+`path` is dot-separated into the domain model. The server resolves it against
+the unmasked model, decrypts server-side and returns the cleartext once
+(`{"value": "...", "sensitive": true}`). Every call is audit-logged with
+subscription id, path, key id and user — never the value. Non-envelope paths
+return 404; undecryptable envelopes return 422.
+
 ## Residual risks
 
 - Cleartext transiently exists in the TLS-terminated request body, in server RAM during the single
@@ -125,8 +144,9 @@ key-id counts and row/process ids only — it never prints secret values.
   carries field input values.
 - A compromised key reads all rows sealed under it. Keep the ring at 1–2 keys, keep keys out of
   backups and log pipelines, and never expose `SEALED_SECRETS_FERNET_KEYS` via settings endpoints.
-- Envelopes leak approximate plaintext length and are visible to anyone with database or API read
-  access — RBAC remains the outer wall. Ciphertext is readable by any authorized reader; there is no
-  API-level masking.
+- Envelopes leak approximate plaintext length if exfiltrated from the database —
+  keep keys out of backups and log pipelines, and never expose
+  `SEALED_SECRETS_FERNET_KEYS` via settings endpoints. API list/detail payloads
+  are masked (`••••••`); use the audited `POST .../reveal` for one-off display.
 - Workflow authors can still footgun by logging a decrypted value or returning it into state.
   Decrypt late, use immediately, drop the reference.

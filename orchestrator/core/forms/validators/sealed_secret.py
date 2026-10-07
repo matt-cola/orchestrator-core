@@ -268,6 +268,34 @@ def is_sealed_envelope(value: object) -> bool:
     return isinstance(value, str) and SEALED_ENVELOPE_RE.match(value) is not None
 
 
+def mask_sealed_envelopes(value: Any) -> Any:
+    """Replace every sealed envelope in a structure with the display mask.
+
+    Walks dicts, lists, tuples, sets and frozensets recursively; every string leaf
+    matching :func:`is_sealed_envelope` becomes :data:`SEALED_SUMMARY_MASK`.
+    All other values pass through unchanged (same object for scalars, new
+    containers for collections). Pure; safe to apply at API presentation
+    boundaries (REST domain-model, GraphQL detail, process state).
+
+    Args:
+        value: Any JSON-like structure possibly holding envelopes.
+
+    Returns:
+        The structure with envelopes masked.
+    """
+    if is_sealed_envelope(value):
+        return SEALED_SUMMARY_MASK
+    if isinstance(value, dict):
+        return {key: mask_sealed_envelopes(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [mask_sealed_envelopes(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(mask_sealed_envelopes(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return [mask_sealed_envelopes(item) for item in value]
+    return value
+
+
 def _field_format(json_schema_extra: Any) -> str | None:
     """Return the ``format`` key a field's ``json_schema_extra`` renders as, dict- or callable-based."""
     if isinstance(json_schema_extra, dict):
