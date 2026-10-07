@@ -200,7 +200,12 @@ class ProductTraverser(BaseTraverser):
 
     @classmethod
     def _extract_block_schema(cls, block_instance: ProductBlockModel, block_path: str) -> list[ExtractedField]:
-        """Extract schema information from a block instance, returning field names as RESOURCE_TYPE."""
+        """Extract schema information from a block instance, returning field names as RESOURCE_TYPE.
+
+        Only field *names* are indexed here (never values), so sealed-secret ciphertext cannot leak
+        through this path. Sealed fields are still skipped explicitly so even the field name of a
+        secret never enters the search index.
+        """
         fields = []
 
         # Add the block itself as a BLOCK type
@@ -209,7 +214,11 @@ class ProductTraverser(BaseTraverser):
 
         # Extract all field names from the block as RESOURCE_TYPE
         if hasattr(type(block_instance), "model_fields"):
-            all_field_names = [name for name, _ in iter_model_field_annotations(type(block_instance))]
+            all_field_names = [
+                name
+                for name, annotation in iter_model_field_annotations(type(block_instance))
+                if not is_sealed_secret_annotation(annotation)
+            ]
 
             for field_name in all_field_names:
                 field_value = getattr(block_instance, field_name, None)

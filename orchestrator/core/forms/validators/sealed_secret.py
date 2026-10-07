@@ -24,10 +24,12 @@ the values of sealed-secret fields, leaving every other field untouched for debu
 form's sealed fields cannot be fully resolved, the values are omitted from the log entirely.
 """
 
+import binascii
 import re
 from base64 import urlsafe_b64decode
 from collections.abc import Generator, Iterable
 from copy import deepcopy
+from enum import Enum
 from hashlib import sha256
 from typing import Annotated, Any, get_args
 
@@ -58,6 +60,12 @@ _MAX_GENERATOR_PAGES = 25
 
 MAX_SEALED_PLAINTEXT_BYTES = 4096
 """Largest accepted cleartext secret (UTF-8 bytes). Bounds DB row, RAM and log-pipeline exposure."""
+
+MAX_STORED_ENVELOPE_CHARS = 10000
+"""Storage cap for a rendered envelope. Mirrors ``SubscriptionInstanceValueTable.value``
+(``String(RESOURCE_VALUE_LENGTH)``) so a minted envelope can never overflow the column; the
+4096-byte plaintext cap keeps every Fernet envelope (base64 overhead + prefix) well below it.
+"""
 
 
 class SealedSecretsDisabledError(ValueError):
@@ -104,7 +112,8 @@ def encrypt_sealed_secret(plaintext: str) -> str:
 
     Raises:
         SealedSecretsDisabledError: When no Fernet key is configured.
-        ValueError: When the plaintext exceeds the size cap.
+        ValueError: When the plaintext exceeds the size cap, or the minted envelope would not fit
+            the storage column.
     """
     encoded = plaintext.encode("utf-8")
     if len(encoded) > MAX_SEALED_PLAINTEXT_BYTES:
@@ -115,7 +124,12 @@ def encrypt_sealed_secret(plaintext: str) -> str:
             "Sealed secrets are disabled (SEALED_SECRETS_FERNET_KEYS is empty); refusing to store plaintext"
         )
     kid, fernet = pairs[0]
-    return f"{SEALED_ENVELOPE_VERSION}:{kid}:{fernet.encrypt(encoded).decode()}"
+    envelope = f"{SEALED_ENVELOPE_VERSION}:{kid}:{fernet.encrypt(encoded).decode()}"
+    # Storage-bound assertion: a minted envelope must fit the String column it is written to.
+    # Unreachable with the 4096-byte plaintext cap today, so raise rather than truncate.
+    if len(envelope) > MAX_STORED_ENVELOPE_CHARS:
+        raise ValueError(f"Sealed envelope exceeds {MAX_STORED_ENVELOPE_CHARS} characters")
+    return envelope
 
 
 def decrypt_sealed_secret(envelope: str) -> str:
@@ -143,8 +157,12 @@ def decrypt_sealed_secret(envelope: str) -> str:
     ordered = sorted(pairs, key=lambda pair: 0 if pair[0] == kid else 1)
     for _, fernet in ordered:
         try:
-            return fernet.decrypt(token.encode()).decode("utf-8")
-        except InvalidToken:
+            plaintext = fernet.decrypt(token.encode())
+        except (InvalidToken, binascii.Error, ValueError):
+            continue
+        try:
+            return plaintext.decode("utf-8")
+        except UnicodeDecodeError:
             continue
     raise SealedSecretDecryptionError("Cannot decrypt sealed secret with any configured key")
 
@@ -168,12 +186,19 @@ def resolve_sealed_secret_update(incoming: str | None, stored_envelope: str | No
 def _validate_sealed_secret(value: Any) -> Any:
     """Pydantic ``BeforeValidator``.
 
-    ``None`` passes through (keep), envelopes pass through (idempotent), cleartext encrypts.
-    Runs during ``post_form`` validation, before anything is stored. Empty strings are rejected with an
-    actionable error instead of being silently kept: pydantic feeds union members the *original* input,
-    so a member-local ``""``-to-``None`` mapping could never make ``SealedSecret | None`` accept ``""``.
-    The keep semantic is therefore ``null``/omitted (which the UI submits for blank fields); ``""`` fails
-    loudly rather than risking an ambiguous store.
+    ``None`` passes through (keep), current-kid envelopes pass through (no churn), old-kid
+    envelopes are conditionally migrated (decrypt with the ring, re-encrypt to the newest key),
+    cleartext encrypts. Runs during ``post_form`` validation, before anything is stored. Empty
+    strings are rejected with an actionable error instead of being silently kept: pydantic feeds
+    union members the *original* input, so a member-local ``""``-to-``None`` mapping could never
+    make ``SealedSecret | None`` accept ``""``. The keep semantic is therefore ``null``/omitted
+    (which the UI submits for blank fields); ``""`` fails loudly rather than risking an ambiguous
+    store. Non-string inputs fail loudly (closes bytes/enum coercion).
+
+    Envelope migration mirrors :func:`orchestrator.core.services.sealed_secrets.rewrap_envelope`
+    (kid == target skip, decrypt -> encrypt -> verify); kept inline with a lazy import to avoid a
+    validator <-> service import cycle. Future KMS backends only need to change the
+    decrypt/encrypt helpers behind this seam (comment only, no abstraction today per YAGNI).
     """
     if value is None:
         return None
@@ -182,10 +207,39 @@ def _validate_sealed_secret(value: Any) -> Any:
             "sealed_secret_blank",
             "Blank sealed secrets must be submitted as null (keep the stored value); empty strings are rejected",
         )
-    if not isinstance(value, str):
-        return value
+    if isinstance(value, Enum) or not isinstance(value, str):
+        raise PydanticCustomError(
+            "sealed_secret_type",
+            "Sealed secret must be a string (cleartext) or a sealed envelope; got {actual}",
+            {"actual": type(value).__name__},
+        )
     if is_sealed_envelope(value):
-        return value
+        # Lazy import: services.sealed_secrets imports from this module (decrypt/encrypt helpers).
+        from orchestrator.core.services.sealed_secrets import current_kid, envelope_kid
+
+        target = current_kid()
+        if target is None:
+            raise PydanticCustomError(
+                "sealed_secret_undecryptable",
+                "Sealed secrets are disabled (no Fernet key configured); cannot accept stored envelopes",
+            )
+        kid = envelope_kid(value)
+        if kid == target:
+            return value
+        try:
+            plaintext = decrypt_sealed_secret(value)
+        except SealedSecretDecryptionError as exc:
+            raise PydanticCustomError(
+                "sealed_secret_undecryptable",
+                "Stored sealed envelope cannot be decrypted with any configured key",
+            ) from exc
+        fresh = encrypt_sealed_secret(plaintext)
+        if decrypt_sealed_secret(fresh) != plaintext:
+            raise PydanticCustomError(
+                "sealed_secret_undecryptable",
+                "Sealed envelope rewrap round-trip verification failed",
+            )
+        return fresh
     return encrypt_sealed_secret(value)
 
 

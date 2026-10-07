@@ -2,7 +2,7 @@
 
 Password, token and shared-secret fields must never be stored as cleartext in the database — not in
 `input_states`, not in `process_steps.state`, not in resource values. The `SealedSecret` field type gives
-you a normal password box in the UI whose value is Fernet-encrypted during form validation, so only
+you a **password box** in the UI whose value is Fernet-encrypted during form validation, so only
 ciphertext (`fernet-v1:<kid>:<token>` envelopes) is ever persisted. Decryption is server-side only,
 inside workflow steps.
 
@@ -11,12 +11,13 @@ inside workflow steps.
 ```python
 from orchestrator.core.forms.validators import SealedSecret
 
+
 class CreateDeviceForm(FormPage):
     username: str
     password: SealedSecret  # required: blank and null are rejected
 ```
 
-Modify workflows use the write-only rotate pattern — never prefill from the subscription:
+Modify workflows use the write-only rotate pattern — **never prefill from the subscription**:
 
 ```python
 class ModifyDeviceForm(FormPage):
@@ -25,14 +26,26 @@ class ModifyDeviceForm(FormPage):
     password: SealedSecret | None = None
 ```
 
+The UI renders a masked password input (`type="password"`, `autocomplete="new-password"`) for
+`format: sealedSecret` fields and never seeds a stored value into the input, so ciphertext cannot
+reach the DOM.
+
 Key semantics:
 
-- The UI renders a password input and submits `null` for a blank field. **Empty strings are rejected**
-  with a `sealed_secret_blank` validation error — clients must send `null` (or omit the key) for keep.
+- Blank is `null`, not `""`. The UI submits `null` for an untouched field. **Empty strings are
+  rejected** with a `sealed_secret_blank` validation error; there is no silent `""`-to-`None` mapping,
+  because pydantic feeds union members the *original* input, so `SealedSecret | None` would never
+  accept `""` anyway. Failing loudly beats an ambiguous store.
+- Non-string input (bytes, enums, numbers) is rejected with `sealed_secret_type` instead of being
+  coerced into a secret.
 - `None`/omitted survives validation as `None`, so state merges and `ProductBlockModel.save()` keep the
   existing database row untouched (`None` values are skipped on save).
-- A submitted value encrypts to an envelope *before* `store_input_state` runs; re-submitting an
-  envelope passes through unchanged (idempotent re-validation on resume).
+- Cleartext encrypts to an envelope *before* `store_input_state` runs.
+- A submitted envelope is validated again on resume: envelopes already on the **current** key pass
+  through byte-identical (no churn, nothing rewritten), while envelopes on an **older** key are
+  conditionally migrated — decrypted with the ring and re-encrypted to the newest key, with a
+  round-trip verification. An envelope that no configured key can decrypt fails fast with
+  `sealed_secret_undecryptable` instead of being stored or logged.
 - In the step that needs the secret, decrypt at the point of use and never return it into state:
 
 ```python
@@ -42,13 +55,17 @@ envelope = resolve_sealed_secret_update(user_input.get("password"), subscription
 secret = decrypt_sealed_secret(envelope)  # use immediately; never log it, never return it
 ```
 
-- Sealed values never appear in summary tables (rendered as `••••••`) and are excluded from the
-  search index. Validation-error logs mask sealed cleartext and log everything else as usual.
+- Sealed values never appear in summary tables, at any nesting depth: a value holding an envelope
+  renders as `••••••`, plain siblings in mixed lists survive, and formatter output is scanned too
+  (a sealed field is masked *before* any custom formatter sees it). Sealed fields are excluded from
+  the search index, and validation-error logs mask sealed cleartext while logging everything else
+  as usual.
 
 ## Configuration
 
 Sealed secrets are **disabled** until keys are configured — any form using `SealedSecret` then fails
-validation instead of storing plaintext (fail closed):
+validation instead of storing plaintext (fail closed). An already-stored envelope submitted while
+disabled is also rejected, rather than being round-tripped blind:
 
 ```bash
 SEALED_SECRETS_FERNET_KEYS='["<current-key>", "<previous-key>"]'
@@ -57,41 +74,59 @@ SEALED_SECRETS_FERNET_KEYS='["<current-key>", "<previous-key>"]'
 Each entry is a standard Fernet key (44-char urlsafe base64; generate with
 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`).
 At most **two** keys may be listed: the current key first, plus one predecessor during rotation.
-Invalid keys are rejected at startup.
+Invalid keys are rejected at startup. Keep `EXPOSE_SETTINGS=false`: the keys are `SecretStr` and
+masked in `/settings/overview`, but exposing settings is unnecessary risk.
 
-## Rotation runbook
+## Rotation runbook: drain → rewrap → gate
 
-History rows (`input_states`, `process_steps`) are **never rewritten**. Rotation is lazy:
+History rows (`input_states`, `process_steps`) are **never rewritten**, so dropping a key makes every
+envelope sealed under it permanently undecryptable — including the history of processes that can
+still be resumed. The command therefore gates on two things: *current subscription values* (rewritable)
+and *active process history* (not rewritable, so it must be drained first).
+
+Only `completed` and `aborted` histories are ignored by the gate. Everything else counts as active,
+**including `failed`** and its retryable `inconsistent_data` / `api_unavailable` subtypes, because
+those can still be retried (`PUT /resume`, `PUT /resume-all`).
 
 1. Generate a new key. Prepend it: `'["<new>", "<old>"]'`. Deploy.
-2. Preview: `orchestrator secrets rewrap-sealed-secrets` (dry run, no writes).
-3. Apply: `orchestrator secrets rewrap-sealed-secrets --execute` (confirms, rewrites current
-   subscription values batch by batch with per-batch verify, resumable on crash).
-4. Gate: `orchestrator secrets rewrap-sealed-secrets --check` (exit 0 when no rows remain on old
-   keys). **Before dropping the old key:** `--check` covers current subscription values only.
-   History rows (`input_states`, `process_steps`) still carry envelopes sealed under `<old>` and
-   are never rewritten — removing the key from the ring makes those historical envelopes
-   **permanently undecryptable**. Drop `<old>` only when decrypting history is no longer required,
-   then deploy and destroy the old key material.
+2. **Drain.** Retry active processes until they reach `COMPLETED` (`PUT /resume`, `PUT /resume-all`),
+   or ask the starter to abort the ones nobody will finish (`PUT /abort`). Aborting keeps the process
+   row for audit while shedding its history, which is exactly the tradeoff the gate accepts for
+   terminated work. The rewrap tool **never aborts** anything itself.
+3. Preview: `orchestrator secrets rewrap-sealed-secrets` (dry run, no writes).
+4. Apply: `orchestrator secrets rewrap-sealed-secrets --execute`. It re-checks active history and
+   refuses to run while anything blocks, then rewrites *current subscription values* batch by batch
+   with per-batch verify (resumable on crash, per-batch transactions).
+5. **Gate.** `orchestrator secrets rewrap-sealed-secrets --check` until exit 0. Re-run it
+   *immediately before* dropping the key: preview and execute are not atomic, the keyset batch order
+   is not stable, and any process that starts, resumes, calls back or is kept in the meantime can
+   re-dirty history. Quiesce those paths for the final check.
+6. Drop the old key, deploy, then destroy the old key material. Escrow a copy until the final `--check`
+   is green — once dropped, terminated history shreds: the audit rows stay, the secrets do not.
+
+Exit codes: `0` clean, `1` dirty (rows or blocking processes on non-current keys), `2` sealed
+secrets disabled.
 
 There is intentionally no scheduled re-encryption task: a timer that decrypts every secret row
-maximizes key exposure for no functional benefit. The command above is manual and audited, rewrites
-*current subscription values only* (never history), and reports failed row ids without ever printing
-secret values.
+maximizes key exposure for no functional benefit. The command above is manual and audit-logged with
+key-id counts and row/process ids only — it never prints secret values.
 
 ## Residual risks
 
 - Cleartext transiently exists in the TLS-terminated request body, in server RAM during the single
   validation call, and again when a step decrypts the secret to use it. This matches the standard
   HTTPS-login model; the guarantee covers storage, not RAM.
-- At `LOG_LEVEL=DEBUG`, `pydantic_forms` itself logs raw `user_inputs` (in `post_form` and its
-  translation step), so cleartext can still reach the log pipeline at debug level. Keep production
-  log level at INFO or above. The validation-error logs in `orchestrator.core` are safe at any
-  level: sealed values are masked — or the inputs omitted entirely when the form's sealed fields
-  cannot be resolved — and the logged error message never carries field input values.
+- `pydantic_forms` itself logs raw `user_inputs` at DEBUG (`post_form` and its translation step), so
+  cleartext can still reach the log pipeline at debug level. The `pydantic_forms` logger is pinned to
+  `INFO` in `log_config.py` for exactly this reason; override at deploy time only with
+  `LOG_LEVEL_PYDANTIC_FORMS=DEBUG` and accept the exposure. The validation-error logs in
+  `orchestrator.core` are safe at any level: sealed values are masked — or the inputs omitted
+  entirely when the form's sealed fields cannot be resolved — and the logged error message never
+  carries field input values.
 - A compromised key reads all rows sealed under it. Keep the ring at 1–2 keys, keep keys out of
   backups and log pipelines, and never expose `SEALED_SECRETS_FERNET_KEYS` via settings endpoints.
 - Envelopes leak approximate plaintext length and are visible to anyone with database or API read
-  access — RBAC remains the outer wall.
+  access — RBAC remains the outer wall. Ciphertext is readable by any authorized reader; there is no
+  API-level masking.
 - Workflow authors can still footgun by logging a decrypted value or returning it into state.
   Decrypt late, use immediately, drop the reference.

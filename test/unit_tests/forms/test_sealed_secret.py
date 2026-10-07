@@ -17,9 +17,11 @@ import pytest
 from cryptography.fernet import Fernet
 from pydantic import BaseModel, Field, SecretStr, ValidationError
 
+from orchestrator.core.db.models import RESOURCE_VALUE_LENGTH
 from orchestrator.core.forms.summary_form.summary_form import _get_column_values
 from orchestrator.core.forms.validators.sealed_secret import (
     MAX_SEALED_PLAINTEXT_BYTES,
+    MAX_STORED_ENVELOPE_CHARS,
     SEALED_REDACTED,
     SEALED_SUMMARY_MASK,
     SealedSecret,
@@ -229,6 +231,16 @@ def test_encrypt_rejects_oversize_plaintext(sealed_keys):
         encrypt_sealed_secret("x" * (MAX_SEALED_PLAINTEXT_BYTES + 1))
 
 
+def test_encrypt_envelope_fits_storage_column(sealed_keys):
+    envelope = encrypt_sealed_secret("x" * MAX_SEALED_PLAINTEXT_BYTES)
+    assert len(envelope) <= MAX_STORED_ENVELOPE_CHARS
+    assert len(envelope) < MAX_STORED_ENVELOPE_CHARS
+
+
+def test_storage_cap_matches_resource_value_column_length():
+    assert MAX_STORED_ENVELOPE_CHARS == RESOURCE_VALUE_LENGTH
+
+
 def test_decrypt_old_envelope_after_rotation(monkeypatch):
     monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_A)])
     old_envelope = encrypt_sealed_secret(SECRET)
@@ -302,6 +314,92 @@ def test_sealed_secret_field_accepts_envelope_idempotently(sealed_keys):
     assert form.model_dump()["password"] == envelope
 
 
+def test_sealed_secret_field_current_envelope_has_no_churn(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    form = TypedSecretForm(username="alice", password=envelope)
+    assert form.model_dump()["password"] == envelope
+
+
+def test_sealed_secret_field_upgrades_old_kid_envelope(monkeypatch):
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_A)])
+    old_envelope = encrypt_sealed_secret(SECRET)
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_B), SecretStr(KEY_A)])
+    form = TypedSecretForm(username="alice", password=old_envelope)
+    fresh = form.model_dump()["password"]
+    assert fresh != old_envelope
+    assert is_sealed_envelope(fresh)
+    assert fresh.startswith(f"fernet-v1:{key_id_for_fernet_key(KEY_B)}:")
+    assert decrypt_sealed_secret(fresh) == SECRET
+
+
+def test_sealed_secret_field_rejects_envelope_when_disabled(monkeypatch):
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_A)])
+    envelope = encrypt_sealed_secret(SECRET)
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [])
+    with pytest.raises(ValidationError, match="sealed_secret_undecryptable"):
+        TypedSecretForm(username="alice", password=envelope)
+
+
+def test_sealed_secret_field_rejects_foreign_envelope(sealed_keys):
+    foreign_key = Fernet.generate_key().decode()
+    orphan = f"fernet-v1:{key_id_for_fernet_key(foreign_key)}:{Fernet(foreign_key.encode()).encrypt(b'x').decode()}"
+    with pytest.raises(ValidationError, match="sealed_secret_undecryptable"):
+        TypedSecretForm(username="alice", password=orphan)
+
+
+def test_sealed_secret_field_rejects_tampered_old_envelope(monkeypatch):
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_A)])
+    old_envelope = encrypt_sealed_secret(SECRET)
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_B), SecretStr(KEY_A)])
+    tampered = old_envelope[:-4] + "AAAA"
+    with pytest.raises(ValidationError, match="sealed_secret_undecryptable"):
+        TypedSecretForm(username="alice", password=tampered)
+
+
+def test_sealed_secret_field_current_envelope_passes_without_reverify(sealed_keys):
+    # No-churn contract: current-kid envelopes are trusted as-is (tampering surfaces at
+    # decrypt time inside the workflow step, not at form validation).
+    envelope = encrypt_sealed_secret(SECRET)
+    tampered = envelope[:-4] + "AAAA"
+    form = TypedSecretForm(username="alice", password=tampered)
+    assert form.model_dump()["password"] == tampered
+
+
+@pytest.mark.parametrize("bad_value", [b"bytes-secret", 123, ["x"], {"k": "v"}])
+def test_sealed_secret_field_rejects_non_string_inputs(sealed_keys, bad_value):
+    with pytest.raises(ValidationError, match="sealed_secret_type"):
+        TypedSecretForm(username="alice", password=bad_value)
+
+
+def test_sealed_secret_field_rejects_non_string_enum_coercion(sealed_keys):
+    from enum import Enum
+
+    class Choice(str, Enum):
+        OPTION = "option-value"
+
+    with pytest.raises(ValidationError, match="sealed_secret_type"):
+        TypedSecretForm(username="alice", password=Choice.OPTION)
+
+
+def test_decrypt_rejects_non_utf8_payload(sealed_keys):
+    raw_key = app_settings.SEALED_SECRETS_FERNET_KEYS[0].get_secret_value().encode()
+    token = Fernet(raw_key).encrypt(b"\xff\xfe\x00invalid-utf8").decode()
+    envelope = f"fernet-v1:{key_id_for_fernet_key(raw_key.decode())}:{token}"
+    assert is_sealed_envelope(envelope)
+    with pytest.raises(SealedSecretDecryptionError):
+        decrypt_sealed_secret(envelope)
+
+
+def test_sealed_secret_field_rejects_non_utf8_old_envelope(monkeypatch):
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_A)])
+    raw_a = KEY_A.encode()
+    token = Fernet(raw_a).encrypt(b"\xff\xfe\x00invalid-utf8").decode()
+    old_envelope = f"fernet-v1:{key_id_for_fernet_key(KEY_A)}:{token}"
+    monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [SecretStr(KEY_B), SecretStr(KEY_A)])
+    with pytest.raises(ValidationError, match="sealed_secret_undecryptable"):
+        TypedSecretForm(username="alice", password=old_envelope)
+
+
 def test_sealed_secret_field_fails_closed_when_disabled(monkeypatch):
     monkeypatch.setattr(app_settings, "SEALED_SECRETS_FERNET_KEYS", [])
     with pytest.raises(ValidationError):
@@ -350,6 +448,57 @@ def test_summary_masks_envelopes_inside_lists(sealed_keys):
     envelope = encrypt_sealed_secret(SECRET)
     values = _get_column_values({"tokens": [envelope, "plain"]}, {})
     assert values == [str([SEALED_SUMMARY_MASK, "plain"])]
+
+
+def test_summary_masks_nested_dict_envelope(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    values = _get_column_values({"config": {"password": envelope, "user": "alice"}}, {})
+    assert values == [SEALED_SUMMARY_MASK]
+    assert SECRET not in str(values)
+    assert envelope not in str(values)
+
+
+def test_summary_masks_tuple_and_set_envelopes(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    values = _get_column_values({"tokens": (envelope, "plain")}, {})
+    assert values == [str([SEALED_SUMMARY_MASK, "plain"])]
+    assert envelope not in str(values)
+    values = _get_column_values({"tokens": {envelope, "plain"}}, {})
+    assert SEALED_SUMMARY_MASK in values[0]
+    assert "plain" in values[0]
+    assert envelope not in values[0]
+
+
+def test_summary_masks_deeply_nested_envelope(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    values = _get_column_values({"outer": {"inner": [envelope]}}, {})
+    assert values == [SEALED_SUMMARY_MASK]
+    assert envelope not in str(values)
+
+
+def test_summary_scans_formatter_output(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    options = {"formatter": {"password": lambda v: iter([("password", v)])}}
+    values = _get_column_values({"password": "plain-input"}, options)
+    assert values == ["plain-input"]
+    echo_options = {"formatter": {"token": lambda v: iter([("token", envelope)])}}
+    values = _get_column_values({"token": "anything"}, echo_options)
+    assert values == [SEALED_SUMMARY_MASK]
+    assert envelope not in str(values)
+
+
+def test_summary_sealed_short_circuits_formatter(sealed_keys):
+    envelope = encrypt_sealed_secret(SECRET)
+    seen: list = []
+
+    def spy_formatter(v):
+        seen.append(v)
+        yield "password", v
+
+    values = _get_column_values({"password": envelope}, {"formatter": {"password": spy_formatter}})
+    assert values == [SEALED_SUMMARY_MASK]
+    assert seen == []
+    assert envelope not in str(values)
 
 
 # --- Search index exclusion ---

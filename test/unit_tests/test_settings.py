@@ -14,8 +14,10 @@
 import json
 
 import pytest
-from pydantic import ValidationError
+from cryptography.fernet import Fernet
+from pydantic import SecretStr, ValidationError
 
+from orchestrator.core.services.settings_env_variables import expose_settings, get_all_exposed_settings
 from orchestrator.core.settings import AppSettings
 from orchestrator.core.targets import Target
 
@@ -51,3 +53,34 @@ def test_celery_target_queues_rejects_invalid_env_var_at_startup(monkeypatch):
 
     with pytest.raises(ValidationError):
         AppSettings()
+
+
+# --- Sealed-secret key masking in exposed settings ---
+
+
+def test_sealed_secret_keys_not_exposed_by_default():
+    assert AppSettings().EXPOSE_SETTINGS is False
+
+
+def test_sealed_secret_key_list_masks_in_model_dump():
+    key = Fernet.generate_key().decode()
+    dumped = AppSettings(SEALED_SECRETS_FERNET_KEYS=[key]).model_dump()
+    assert key not in str(dumped)
+    assert all(isinstance(entry, SecretStr) for entry in dumped["SEALED_SECRETS_FERNET_KEYS"])
+
+
+def test_sealed_secret_key_list_masks_in_exposed_settings_endpoint_payload():
+    """list[SecretStr] must not leak raw keys through /settings/overview (env_value: Any)."""
+    key = Fernet.generate_key().decode()
+    settings = AppSettings(SEALED_SECRETS_FERNET_KEYS=[key], EXPOSE_SETTINGS=True)
+    registry_name = "test_exposed_app_settings"
+    expose_settings(registry_name, settings)
+    try:
+        exposed = next(item for item in get_all_exposed_settings() if item.name == registry_name)
+        keys = next(v for v in exposed.variables if v.env_name == "SEALED_SECRETS_FERNET_KEYS")
+        assert key not in str(keys.env_value)
+        assert key not in exposed.model_dump_json()
+    finally:
+        from orchestrator.core.services.settings_env_variables import EXPOSED_ENV_SETTINGS_REGISTRY
+
+        EXPOSED_ENV_SETTINGS_REGISTRY.pop(registry_name, None)

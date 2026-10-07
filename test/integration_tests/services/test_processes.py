@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 from http import HTTPStatus
 from threading import Event
 from time import sleep
@@ -20,6 +21,7 @@ from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from pydantic import create_model
 from pydantic_i18n import PydanticI18n
 from sqlalchemy import select
 
@@ -28,6 +30,7 @@ from orchestrator.core.config.assignee import Assignee
 from orchestrator.core.db import ProcessStepTable, ProcessSubscriptionTable, ProcessTable, db
 from orchestrator.core.db.database import transactional
 from orchestrator.core.domain.base import SubscriptionModel
+from orchestrator.core.forms.validators.sealed_secret import SEALED_REDACTED, SealedSecret
 from orchestrator.core.services.executors.threadpool import thread_start_process
 from orchestrator.core.services.processes import (
     RESUME_WORKFLOW_REMOVED_ERROR_MSG,
@@ -739,9 +742,10 @@ async def test_broadcast_process_update_async_invalidates_subscription_cache_on_
     process.last_status = terminal_status
     db.session.commit()
 
-    with mock.patch("orchestrator.core.websocket.websocket_manager") as mock_wsm, mock.patch(
-        "orchestrator.core.websocket.invalidate_subscription_cache_by_id"
-    ) as mock_invalidate:
+    with (
+        mock.patch("orchestrator.core.websocket.websocket_manager") as mock_wsm,
+        mock.patch("orchestrator.core.websocket.invalidate_subscription_cache_by_id") as mock_invalidate,
+    ):
         mock_wsm.enabled = True
         mock_wsm.broadcast_data = mock.AsyncMock()
         mock_invalidate.return_value = None
@@ -777,9 +781,10 @@ async def test_broadcast_process_update_async_does_not_invalidate_subscription_c
     process.last_status = non_terminal_status
     db.session.commit()
 
-    with mock.patch("orchestrator.core.websocket.websocket_manager") as mock_wsm, mock.patch(
-        "orchestrator.core.websocket.invalidate_subscription_cache_by_id"
-    ) as mock_invalidate:
+    with (
+        mock.patch("orchestrator.core.websocket.websocket_manager") as mock_wsm,
+        mock.patch("orchestrator.core.websocket.invalidate_subscription_cache_by_id") as mock_invalidate,
+    ):
         mock_wsm.enabled = True
         mock_wsm.broadcast_data = mock.AsyncMock()
 
@@ -1220,6 +1225,51 @@ def test_resume_process_form_error(mock_load_process, mock_post_form):
         state.unwrap(),
         user_inputs=[{}],
     )
+
+
+SEAL_CLEARTEXT = "resume-path-cleartext-secret"  # noqa: S105 - test fixture, not a credential
+
+
+@mock.patch("orchestrator.core.services.processes.post_form")
+@mock.patch("orchestrator.core.services.processes.load_process")
+def test_resume_process_form_error_masks_sealed_cleartext_in_logs(mock_load_process, mock_post_form, caplog):
+    """The resume validation-error log must never carry sealed cleartext (services/processes.py:716)."""
+    sealed_form_cls = create_model("SealedResumeForm", password=(SealedSecret, ...), token=(str, ""))
+
+    @step("Sealed step")
+    def sealed_step(password: SealedSecret, token: str = ""):  # noqa: ARG001 - form derived from signature
+        return {}
+
+    wf = workflow()(lambda: init >> sealed_step >> step2)
+    # The resume path redacts against the first *step's* form (pstat.log[0].form), so the sealed
+    # field must live on the awaited step, not on the workflow's initial input form.
+    wf.steps[1].form = sealed_form_cls
+    process = ProcessTable(
+        process_id=uuid4(),
+        workflow_id=uuid4(),
+        last_status=ProcessStatus.SUSPENDED,
+        created_by=SYSTEM_USER,
+    )
+    mock_load_process.return_value = ProcessStat(
+        process.process_id, wf, Waiting({"steps": [1]}), wf.steps[1:], current_user="user"
+    )
+
+    class MockEmptyValidationError:
+        def errors(self):
+            return []
+
+    tr = PydanticI18n(translations)
+    mock_post_form.side_effect = FormValidationError("", MockEmptyValidationError(), tr=tr)
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(FormValidationError):
+            resume_process(process, user_inputs=[{"password": SEAL_CLEARTEXT, "token": "plain"}], user="user")
+
+    logged = caplog.text
+    assert SEAL_CLEARTEXT not in logged
+    assert SEALED_REDACTED in logged
+    # Non-sealed fields stay visible for debuggability
+    assert "plain" in logged
 
 
 @mock.patch("orchestrator.core.services.processes.load_process")

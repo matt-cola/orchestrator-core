@@ -153,20 +153,57 @@ def _get_summary_labels(data: dict, options: BaseOptions) -> list[str]:
     return list(chain.from_iterable(field_labels))
 
 
+def _contains_sealed(value: Any) -> bool:
+    """Return True when ``value`` holds a sealed envelope at any depth (str/list/tuple/set/dict).
+
+    Args:
+        value: A summary-table cell value (possibly nested).
+
+    Returns:
+        True if any string leaf is a well-formed sealed envelope.
+    """
+    if is_sealed_envelope(value):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_sealed(item) for item in value.values())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_sealed(item) for item in value)
+    return False
+
+
+def _mask_summary_item(item: Any) -> Any:
+    """Mask sealed envelopes inside a summary item, preserving plain siblings."""
+    if is_sealed_envelope(item):
+        return SEALED_SUMMARY_MASK
+    if isinstance(item, dict):
+        return {key: (SEALED_SUMMARY_MASK if _contains_sealed(val) else val) for key, val in item.items()}
+    if isinstance(item, (list, tuple)):
+        return [_mask_summary_item(entry) for entry in item]
+    if isinstance(item, (set, frozenset)):
+        return [_mask_summary_item(entry) for entry in item]
+    return item
+
+
 def _get_column_values(data: dict, options: BaseOptions) -> list[str]:
     """Returns filtered and formatted values for the given column."""
     formatters = DEFAULT_FORMATTERS | options.get("formatter", {})
 
     def get_value(field: str) -> Iterator[str]:
         field_value = data[field]
-        if formatter := formatters.get(field):
-            yield from (str(value) for _, value in formatter(field_value))
-        elif is_sealed_envelope(field_value):
+        if _contains_sealed(field_value):
             # Sealed secrets are write-only: ciphertext must never be echoed in summary tables,
-            # regardless of author discipline upstream.
-            yield SEALED_SUMMARY_MASK
-        elif isinstance(field_value, list) and any(is_sealed_envelope(item) for item in field_value):
-            yield str([SEALED_SUMMARY_MASK if is_sealed_envelope(item) else item for item in field_value])
+            # regardless of author discipline upstream. Checked before formatters so a sealed
+            # input never reaches a custom formatter; plain siblings in mixed lists survive.
+            if isinstance(field_value, (list, tuple, set, frozenset)):
+                yield str([_mask_summary_item(item) for item in field_value])
+            else:
+                yield SEALED_SUMMARY_MASK
+            return
+        if formatter := formatters.get(field):
+            # Scan formatter output too: a formatter resolving to an envelope must not leak it.
+            yield from (
+                SEALED_SUMMARY_MASK if _contains_sealed(value) else str(value) for _, value in formatter(field_value)
+            )
         else:
             match field_value:
                 case None | []:
